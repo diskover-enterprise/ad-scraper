@@ -71,6 +71,9 @@ def wait_for_run(run_id, log, poll=5, timeout=300):
         time.sleep(poll)
     ds_id = r["data"]["defaultDatasetId"]
     items = api_get(f"datasets/{ds_id}/items?limit=200")
+    # Apify wraps dataset items under data.items
+    if "data" in items:
+        return items["data"].get("items", [])
     return items.get("items", [])
 
 
