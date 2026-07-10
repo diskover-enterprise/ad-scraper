@@ -7,7 +7,6 @@ Deploy on Railway — set APIFY_TOKEN env var.
 import json, time, threading, uuid, urllib.request, os, re
 from urllib.parse import urlparse, quote as urlquote, parse_qs
 from datetime import datetime
-import requests as rq
 from flask import Flask, request, jsonify, render_template_string
 
 app  = Flask(__name__)
@@ -231,6 +230,7 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     Bypasses curious_coder — uses the user's own Facebook session cookies.
     Returns ads in snake_case format compatible with the rest of the app.
     """
+    import requests as rq  # lazy import — not needed unless auth mode is used
     log("  🔐 Authenticated mode — using Facebook session cookies")
 
     # Build cookie jar from Cookie-Editor JSON export
