@@ -264,6 +264,12 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                 run_id = run["data"]["id"]
                 ads    = wait_for_run(run_id, log)
                 log(f"   ✓ {len(ads)} ads returned from dataset")
+                for _i, _a in enumerate(ads[:8]):
+                    _snap = _a.get("snapshot") or {}
+                    _imgs, _vids = extract_urls(_a)
+                    log(f"   [{_i}] active={_a.get('is_active')} gated={_a.get('gated_type')!r} "
+                        f"imgs_raw={len(_snap.get('images') or [])} vids_raw={len(_snap.get('videos') or [])} "
+                        f"extracted_imgs={len(_imgs)} extracted_vids={len(_vids)}")
                 results[i] = ads
             except Exception as e:
                 log(f"   ✗ Error: {e}")
@@ -341,18 +347,23 @@ def build_viewer(brand, country, ads):
             media = (f'<div class="media-wrap img-grid img-count-{min(len(imgs),4)}">'
                      f'{img_html}</div>')
         else:
-            gated   = ad.get("gated_type") or ""
-            is_sens = ad.get("contains_sensitive_content")
+            gated    = ad.get("gated_type") or ""
+            is_sens  = ad.get("contains_sensitive_content")
+            prof_pic = (ad.get("snapshot") or {}).get("page_profile_picture_url") or ""
             if gated:
-                reason = "🔞 Age/sensitivity restricted — creative withheld by Meta"
+                reason = "🔞 Gated — creative withheld by Meta (health/age policy)"
             elif not ad.get("is_active"):
-                reason = "⏸ Inactive ad — creative not served by Meta API"
+                reason = "⏸ Inactive — creative not served by Meta API"
             elif is_sens:
                 reason = "⚠️ Sensitive content — creative withheld by Meta"
             else:
                 reason = "🖼️ No creative returned"
-            media = (f'<div class="media-placeholder"><span style="font-size:13px;color:#999;text-align:center;padding:0 12px">{reason}</span>'
-                     f'<a href="{lib_url}" target="_blank" style="margin-top:6px">View in Ad Library →</a></div>')
+            prof_html = (f'<img src="{pimg(prof_pic)}" style="width:64px;height:64px;border-radius:50%;object-fit:cover;margin-bottom:6px">'
+                         if prof_pic else '<span style="font-size:32px">📄</span>')
+            media = (f'<div class="media-placeholder" style="min-height:120px">'
+                     f'{prof_html}'
+                     f'<span style="font-size:11px;color:#999;text-align:center;padding:0 12px">{reason}</span>'
+                     f'<a href="{lib_url}" target="_blank" style="margin-top:4px;font-size:12px">View in Ad Library →</a></div>')
 
         body_html  = (n["body"]  or "").replace('"', '&quot;').replace('\n', '<br>')
         title_html = (n["title"] or "").replace('"', '&quot;')
