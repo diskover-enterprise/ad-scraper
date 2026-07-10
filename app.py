@@ -47,7 +47,8 @@ COUNTRY_OPTIONS = "\n".join(
 # ── Apify helpers ─────────────────────────────────────────────────────────────
 
 def apify_req(method, path, payload=None):
-    url  = f"{APIFY_BASE}/{path}?token={APIFY_TOKEN}"
+    sep  = "&" if "?" in path else "?"
+    url  = f"{APIFY_BASE}/{path}{sep}token={APIFY_TOKEN}"
     data = json.dumps(payload).encode() if payload else None
     hdrs = {"Content-Type": "application/json"} if data else {}
     req  = urllib.request.Request(url, data=data, headers=hdrs, method=method)
