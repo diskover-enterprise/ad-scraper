@@ -4,9 +4,10 @@ Uses curious_coder/facebook-ads-library-scraper (actor: XtaWFhbtfxyzqrFmd)
 Deploy on Railway — set APIFY_TOKEN env var.
 """
 
-import json, time, threading, uuid, urllib.request, os
-from urllib.parse import urlparse, quote as urlquote
+import json, time, threading, uuid, urllib.request, os, re
+from urllib.parse import urlparse, quote as urlquote, parse_qs
 from datetime import datetime
+import requests as rq
 from flask import Flask, request, jsonify, render_template_string
 
 app  = Flask(__name__)
@@ -222,9 +223,146 @@ def normalize_ad(ad):
     }
 
 
+# ── Authenticated Meta scraper ────────────────────────────────────────────────
+
+def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
+    """
+    Direct authenticated scrape via Meta's internal Ad Library API.
+    Bypasses curious_coder — uses the user's own Facebook session cookies.
+    Returns ads in snake_case format compatible with the rest of the app.
+    """
+    log("  🔐 Authenticated mode — using Facebook session cookies")
+
+    # Build cookie jar from Cookie-Editor JSON export
+    jar = {}
+    for c in cookies_list:
+        n = c.get("name") or c.get("Name", "")
+        v = c.get("value") or c.get("Value", "")
+        if n and v:
+            jar[n] = v
+
+    sess = rq.Session()
+    sess.cookies.update(jar)
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.facebook.com/ads/library/",
+        "Origin": "https://www.facebook.com",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    # Fetch LSD CSRF token from the Ad Library page
+    try:
+        r = sess.get("https://www.facebook.com/ads/library/", timeout=20)
+        lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', r.text)
+        lsd = lsd_m.group(1) if lsd_m else ""
+        log(f"  🔐 LSD token: {'✓' if lsd else '✗ not found (cookies may be invalid)'}")
+        if lsd:
+            sess.headers["X-FB-LSD"] = lsd
+    except Exception as e:
+        log(f"  ❌ Could not load Ad Library page: {e}")
+        return []
+
+    all_ads = []
+
+    for url_obj in search_urls:
+        url = url_obj.get("url", "")
+        if not url:
+            continue
+
+        parsed = urlparse(url)
+        qs     = parse_qs(parsed.query)
+
+        params = {
+            "count":         count,
+            "active_status": ad_status,
+            "ad_type":       "all",
+            "media_type":    "all",
+            "__a":           "1",
+            "lsd":           lsd,
+        }
+
+        if "facebook.com/ads/library" in url:
+            # Standard Ad Library search URL
+            params["search_type"] = qs.get("search_type", ["keyword_unordered"])[0]
+            if "q" in qs:       params["q"]          = qs["q"][0]
+            if "country" in qs: params["country[0]"] = qs["country"][0]
+            else:               params["country[0]"] = country or "US"
+        else:
+            # Facebook page URL — extract numeric page ID
+            pid_m = re.search(r"(?:id=|/)(\d{10,})", url)
+            if pid_m:
+                params["view_all_page_id"] = pid_m.group(1)
+            params["country[0]"] = country or "US"
+
+        try:
+            r    = sess.get("https://www.facebook.com/ads/library/async/search_ads/",
+                            params=params, timeout=30)
+            text = r.text
+            if text.startswith("for(;;);"):
+                text = text[8:]
+            data = json.loads(text)
+
+            # Meta wraps results differently depending on search type
+            results = []
+            payload = data.get("payload", data)
+            if isinstance(payload, list):
+                results = payload
+            elif isinstance(payload, dict):
+                results = payload.get("results", payload.get("data", []))
+
+            log(f"  🔐 {len(results)} ads from Meta API")
+            if results and isinstance(results[0], dict):
+                log(f"  🔐 result[0] keys: {list(results[0].keys())[:12]}")
+
+            # Normalise to snake_case so the rest of the app works unchanged
+            for ad in results:
+                all_ads.append(_norm_meta_api(ad))
+
+        except Exception as e:
+            log(f"  ❌ Meta API call failed: {e}")
+
+    return all_ads
+
+
+def _norm_meta_api(ad):
+    """
+    Convert Meta's internal API ad dict to the snake_case format
+    that curious_coder uses (and that normalize_ad / extract_urls expect).
+    Field names are guessed from known Meta API patterns; debug logging
+    will reveal the real names on first run.
+    """
+    snap = ad.get("snapshot") or ad.get("adData") or {}
+
+    # Try both camelCase (Meta internal) and snake_case (already normalised)
+    def g(*keys):
+        for k in keys:
+            v = ad.get(k) or snap.get(k)
+            if v is not None:
+                return v
+        return None
+
+    return {
+        "ad_archive_id":        str(g("adArchiveID", "ad_archive_id") or ""),
+        "is_active":            bool(g("isActive", "is_active")),
+        "page_name":            g("pageName", "page_name") or "",
+        "start_date":           g("startDate", "start_date") or "",
+        "end_date":             g("endDate", "end_date") or "",
+        "publisher_platform":   g("publisherPlatform", "publisher_platform") or [],
+        "collation_count":      int(g("collationCount", "collation_count") or 0),
+        "impressions_with_index": g("impressionsWithIndex", "impressions_with_index") or {},
+        "gated_type":           "ELIGIBLE",   # authenticated — creatives should be visible
+        "contains_sensitive_content": False,
+        "snapshot":             snap,
+        "ad_library_url":       g("adLibraryUrl", "ad_library_url") or
+                                f"https://www.facebook.com/ads/library/?id={g('adArchiveID','ad_archive_id') or ''}",
+    }
+
+
 # ── Scrape worker ─────────────────────────────────────────────────────────────
 
-def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
+def run_job(job_id, brand, country, searches, domain, page_url, ad_status, cookies=None):
     job = jobs[job_id]
     def log(msg): job["log"].append(msg)
 
@@ -260,16 +398,14 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                     results[i] = []
                     return
 
-                run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15, "scrapeAdDetails": True})
-                run_id = run["data"]["id"]
-                ads    = wait_for_run(run_id, log)
-                log(f"   ✓ {len(ads)} ads returned from dataset")
-                for _i, _a in enumerate(ads[:8]):
-                    _snap = _a.get("snapshot") or {}
-                    _imgs, _vids = extract_urls(_a)
-                    log(f"   [{_i}] active={_a.get('is_active')} gated={_a.get('gated_type')!r} "
-                        f"imgs_raw={len(_snap.get('images') or [])} vids_raw={len(_snap.get('videos') or [])} "
-                        f"extracted_imgs={len(_imgs)} extracted_vids={len(_vids)}")
+                if cookies:
+                    ads = meta_auth_search(urls, cookies, count=20,
+                                           country=_country, ad_status=_status, log=log)
+                else:
+                    run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15, "scrapeAdDetails": True})
+                    run_id = run["data"]["id"]
+                    ads    = wait_for_run(run_id, log)
+                log(f"   ✓ {len(ads)} ads returned")
                 results[i] = ads
             except Exception as e:
                 log(f"   ✗ Error: {e}")
@@ -350,8 +486,10 @@ def build_viewer(brand, country, ads):
             gated    = ad.get("gated_type") or ""
             is_sens  = ad.get("contains_sensitive_content")
             prof_pic = (ad.get("snapshot") or {}).get("page_profile_picture_url") or ""
-            if gated:
-                reason = "🔞 Gated — creative withheld by Meta (health/age policy)"
+            if gated == "LOGGED_OUT":
+                reason = "🔒 Login required — Meta only serves this creative to authenticated users"
+            elif gated and gated != "ELIGIBLE":
+                reason = "🔞 Gated — creative withheld by Meta policy"
             elif not ad.get("is_active"):
                 reason = "⏸ Inactive — creative not served by Meta API"
             elif is_sens:
@@ -843,6 +981,22 @@ input:focus,select:focus{border-color:#1877f2;box-shadow:0 0 0 3px rgba(24,119,2
       <input name="page_url" placeholder="e.g. https://www.facebook.com/BeyondTheScale">
     </div>
 
+    <div class="divider">
+      <details>
+        <summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#555;list-style:none;display:flex;align-items:center;gap:6px">
+          <span>🔐</span> Authenticated scraping <span style="font-weight:normal;color:#aaa">(optional — unlocks login-restricted creatives)</span>
+        </summary>
+        <div style="margin-top:10px">
+          <p style="font-size:11px;color:#888;line-height:1.5;margin-bottom:8px">
+            Install <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" style="color:#1877f2">Cookie-Editor</a> in Chrome → log into Facebook → click the extension → <strong>Export → Export as JSON</strong> → paste below.<br>
+            When provided, scraping goes directly to Meta's API (no Apify cost) and can see all ad creatives.
+          </p>
+          <textarea name="cookies" placeholder='[{"name":"datr","value":"..."},{"name":"c_user","value":"..."},...]'
+            style="width:100%;height:72px;padding:8px 10px;border:1px solid #ddd;border-radius:7px;font-size:11px;font-family:monospace;resize:vertical;outline:none;color:#444"></textarea>
+        </div>
+      </details>
+    </div>
+
     <button type="submit" class="submit-btn">🔍 Run Scrape</button>
   </form>
 </div>
@@ -936,6 +1090,17 @@ def start():
     if not searches:
         searches = [[]]
 
+    # Parse optional Facebook session cookies (Cookie-Editor JSON export)
+    cookies = None
+    cookies_raw = request.form.get("cookies", "").strip()
+    if cookies_raw:
+        try:
+            cookies = json.loads(cookies_raw)
+            if not isinstance(cookies, list):
+                cookies = None
+        except Exception:
+            cookies = None
+
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "running", "log": [], "html": None}
     global last_job_id
@@ -944,6 +1109,7 @@ def start():
     threading.Thread(
         target=run_job,
         args=(job_id, brand, country, searches, domain, page_url, ad_status),
+        kwargs={"cookies": cookies},
         daemon=True
     ).start()
 
