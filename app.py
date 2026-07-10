@@ -10,7 +10,8 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 
 app  = Flask(__name__)
-jobs = {}  # { job_id: {status, log, html} }
+jobs = {}        # { job_id: {status, log, html} }
+last_job_id = None  # track most recent job for /logs endpoint
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -878,11 +879,11 @@ def start():
     searches     = [[q.strip() for q in s.split(",") if q.strip()] for s in searches_raw if s.strip()]
     brand        = domain_input or page_url or "Meta Ads"  # label for results page only
 
-    # Extract clean domain
+    # Extract clean domain (handles full URLs like https://trimrx.com/path?query=1)
     domain = ""
     if domain_input:
         raw = domain_input if "://" in domain_input else "https://" + domain_input
-        domain = urlparse(raw).netloc
+        domain = urlparse(raw).netloc  # strips path, query, fragment — just hostname
 
     # If domain/page_url provided but no keywords, fire one thread with just those
     if not searches:
@@ -890,6 +891,8 @@ def start():
 
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "running", "log": [], "html": None}
+    global last_job_id
+    last_job_id = job_id
 
     threading.Thread(
         target=run_job,
@@ -903,6 +906,19 @@ def start():
 def status(job_id):
     job = jobs.get(job_id, {})
     return jsonify({"status": job.get("status", "unknown"), "log": job.get("log", [])})
+
+@app.route("/logs")
+@app.route("/logs/<job_id>")
+def logs(job_id=None):
+    jid = job_id or last_job_id
+    if not jid or jid not in jobs:
+        return "No job found yet — run a scrape first.", 404
+    job = jobs[jid]
+    lines = "\n".join(job.get("log", []))
+    return (f"<pre style='font-family:monospace;font-size:13px;background:#0d1117;color:#7ee787;"
+            f"padding:24px;min-height:100vh;margin:0;white-space:pre-wrap'>"
+            f"Job: {jid}  |  Status: {job.get('status','?')}\n"
+            f"{'─'*60}\n{lines}</pre>")
 
 @app.route("/result/<job_id>")
 def result(job_id):
