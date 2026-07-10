@@ -70,11 +70,15 @@ def wait_for_run(run_id, log, poll=5, timeout=300):
             break
         time.sleep(poll)
     ds_id = r["data"]["defaultDatasetId"]
-    items = api_get(f"datasets/{ds_id}/items?limit=200")
-    # Apify wraps dataset items under data.items
-    if "data" in items:
-        return items["data"].get("items", [])
-    return items.get("items", [])
+    raw = api_get(f"datasets/{ds_id}/items?limit=200")
+    # Apify may return items as a raw list OR wrapped in {"data": {"items": [...]}}
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        if "data" in raw:
+            return raw["data"].get("items", [])
+        return raw.get("items", [])
+    return []
 
 
 # ── Ad data helpers ───────────────────────────────────────────────────────────
@@ -219,7 +223,7 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                 run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15})
                 run_id = run["data"]["id"]
                 ads    = wait_for_run(run_id, log)
-                log(f"   ✓ {len(ads)} ads")
+                log(f"   ✓ {len(ads)} ads returned from dataset")
                 results[i] = ads
             except Exception as e:
                 log(f"   ✗ Error: {e}")
