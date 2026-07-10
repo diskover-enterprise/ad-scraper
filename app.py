@@ -86,85 +86,101 @@ def wait_for_run(run_id, log, poll=5, timeout=300):
 # ── Ad data helpers ───────────────────────────────────────────────────────────
 
 def extract_urls(ad):
-    """Return (images[], videos[]) from a curious_coder ad record."""
+    """Return (images[], videos[]) from a curious_coder ad record.
+    Field names confirmed snake_case from debug output.
+    """
     imgs, vids = [], []
     snap = ad.get("snapshot") or {}
 
-    # snapshot.images[] — array of image objects (most common format)
-    for img_obj in snap.get("images", []):
-        if isinstance(img_obj, dict):
-            for key in ("resized_image_url", "original_image_url"):
-                v = img_obj.get(key)
-                if v and v not in imgs:
-                    imgs.append(v)
-        elif isinstance(img_obj, str) and img_obj not in imgs:
-            imgs.append(img_obj)
-
-    # snapshot.videos[] — array of video objects
-    for vid_obj in snap.get("videos", []):
-        if isinstance(vid_obj, dict):
-            for key in ("video_hd_url", "video_sd_url"):
-                v = vid_obj.get(key)
-                if v and v not in vids:
-                    vids.append(v)
-            # Video preview as image fallback
-            prev = vid_obj.get("video_preview_image_url")
-            if prev and prev not in imgs:
-                imgs.append(prev)
-        elif isinstance(vid_obj, str) and vid_obj not in vids:
-            vids.append(vid_obj)
-
-    # Carousel cards
-    for card in snap.get("cards", []):
-        for key in ("resized_image_url", "original_image_url"):
-            v = card.get(key)
-            if v and v not in imgs:
-                imgs.append(v)
-        for key in ("video_hd_url", "video_sd_url"):
-            v = card.get(key)
-            if v and v not in vids:
-                vids.append(v)
-
-    # Top-level fallback keys
-    for key in ("resized_image_url", "original_image_url"):
-        v = snap.get(key) or ad.get(key)
-        if v and v not in imgs:
+    def add_img(v):
+        if v and isinstance(v, str) and v not in imgs:
             imgs.append(v)
-    for key in ("video_hd_url", "video_sd_url"):
-        v = snap.get(key) or ad.get(key)
-        if v and v not in vids:
+    def add_vid(v):
+        if v and isinstance(v, str) and v not in vids:
             vids.append(v)
 
-    # Video preview fallback
+    # snapshot.images[] — objects with resized_image_url / original_image_url / url
+    for img_obj in snap.get("images") or []:
+        if isinstance(img_obj, dict):
+            add_img(img_obj.get("resized_image_url"))
+            add_img(img_obj.get("original_image_url"))
+            add_img(img_obj.get("url"))
+        elif isinstance(img_obj, str):
+            add_img(img_obj)
+
+    # snapshot.videos[]
+    for vid_obj in snap.get("videos") or []:
+        if isinstance(vid_obj, dict):
+            add_vid(vid_obj.get("video_hd_url"))
+            add_vid(vid_obj.get("video_sd_url"))
+            add_vid(vid_obj.get("url"))
+            add_img(vid_obj.get("video_preview_image_url"))
+            add_img(vid_obj.get("thumbnail_url"))
+        elif isinstance(vid_obj, str):
+            add_vid(vid_obj)
+
+    # Carousel cards
+    for card in snap.get("cards") or []:
+        add_img(card.get("resized_image_url"))
+        add_img(card.get("original_image_url"))
+        add_img(card.get("url"))
+        add_vid(card.get("video_hd_url"))
+        add_vid(card.get("video_sd_url"))
+
+    # extra_images / extra_videos (confirmed in snapshot keys)
+    for img_obj in snap.get("extra_images") or []:
+        if isinstance(img_obj, dict):
+            add_img(img_obj.get("resized_image_url"))
+            add_img(img_obj.get("original_image_url"))
+            add_img(img_obj.get("url"))
+        elif isinstance(img_obj, str):
+            add_img(img_obj)
+    for vid_obj in snap.get("extra_videos") or []:
+        if isinstance(vid_obj, dict):
+            add_vid(vid_obj.get("video_hd_url"))
+            add_vid(vid_obj.get("video_sd_url"))
+            add_vid(vid_obj.get("url"))
+        elif isinstance(vid_obj, str):
+            add_vid(vid_obj)
+
+    # Top-level snapshot fallbacks
+    add_img(snap.get("resized_image_url"))
+    add_img(snap.get("original_image_url"))
+    add_vid(snap.get("video_hd_url"))
+    add_vid(snap.get("video_sd_url"))
+
+    # Video-only: use preview as image stand-in
     if vids and not imgs:
-        prev = snap.get("video_preview_image_url") or ad.get("video_preview_image_url")
-        if prev:
-            imgs.append(prev)
+        add_img(snap.get("video_preview_image_url"))
 
     return imgs, vids
 
 
 def normalize_ad(ad):
-    """Flatten a curious_coder record into a display dict."""
+    """Flatten a curious_coder record into a display dict.
+    All top-level fields use snake_case (confirmed from debug output).
+    """
     snap = ad.get("snapshot") or {}
 
-    name = ad.get("pageName") or snap.get("page_name") or "Unknown"
+    name = ad.get("page_name") or snap.get("page_name") or "Unknown"
 
-    status = "ACTIVE" if ad.get("isActive") else "INACTIVE"
+    status = "ACTIVE" if ad.get("is_active") else "INACTIVE"
 
-    raw_date = ad.get("startDate", "")
+    raw_date = ad.get("start_date", "")
     if isinstance(raw_date, (int, float)) and raw_date > 0:
         try:
             raw_date = datetime.fromtimestamp(raw_date).strftime("%Y-%m-%d")
         except Exception:
             raw_date = ""
+    elif isinstance(raw_date, str) and raw_date:
+        pass  # already a string date
 
     body  = (snap.get("body")  or {})
     body  = body.get("text", "") if isinstance(body, dict) else str(body or "")
     title = (snap.get("title") or {})
     title = title.get("text", "") if isinstance(title, dict) else str(title or "")
 
-    cta = snap.get("cta_text") or snap.get("call_to_action_type") or ""
+    cta = snap.get("cta_text") or snap.get("cta_type") or ""
 
     landing = snap.get("link_url") or snap.get("landing_page_url") or ""
     if not landing:
@@ -173,21 +189,21 @@ def normalize_ad(ad):
             if landing:
                 break
 
-    ad_id   = str(ad.get("adArchiveID") or ad.get("ad_archive_id") or ad.get("archiveID") or ad.get("id") or "")
-    lib_url = f"https://www.facebook.com/ads/library/?id={ad_id}" if ad_id else "#"
+    ad_id   = str(ad.get("ad_archive_id") or ad.get("ad_id") or "")
+    lib_url = ad.get("ad_library_url") or (f"https://www.facebook.com/ads/library/?id={ad_id}" if ad_id else "#")
 
     # Impressions index → human range
     impressions = ""
-    imp = ad.get("impressionsWithIndex") or {}
+    imp = ad.get("impressions_with_index") or {}
     if isinstance(imp, dict):
         idx    = imp.get("impressionsIndex", -1)
         ranges = ["<1K", "1K–5K", "5K–20K", "20K–50K", "50K–100K", "100K–500K", "500K–1M", ">1M"]
         if 0 <= idx < len(ranges):
             impressions = ranges[idx]
 
-    variants = ad.get("collationCount", 0) or 0
+    variants = ad.get("collation_count", 0) or 0
 
-    pubs  = ad.get("publisherPlatform") or []
+    pubs  = ad.get("publisher_platform") or []
     plats = ", ".join(p.capitalize() for p in pubs) if pubs else "Facebook"
 
     return {
@@ -292,7 +308,7 @@ def build_viewer(brand, country, ads):
     C = "#1877f2"  # Meta blue
 
     total      = len(ads) or 1
-    active_cnt = sum(1 for a in ads if a.get("isActive"))
+    active_cnt = sum(1 for a in ads if a.get("is_active"))
     has_media  = sum(1 for a in ads if any(extract_urls(a)))
     q_media    = round(has_media / total * 100)
 
