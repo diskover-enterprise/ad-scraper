@@ -836,6 +836,7 @@ p.sub{font-size:13px;color:#666;margin-bottom:20px}
   <h2><div class="spinner"></div>Scraping Meta ads for <strong>{{ brand }}</strong></h2>
   <p class="sub">This takes 30–90 seconds — stay on this page.</p>
   <div id="log"></div>
+  <a id="view-btn" href="/result/{{ job_id }}" style="display:none;margin-top:20px;background:#1877f2;color:white;text-decoration:none;border-radius:8px;padding:13px 24px;font-size:15px;font-weight:bold;text-align:center;display:none;width:100%;box-sizing:border-box">View Ads →</a>
 </div>
 <script>
 const jobId = "{{ job_id }}";
@@ -852,9 +853,14 @@ function poll() {
       });
       seen = d.log.length;
       logEl.scrollTop = logEl.scrollHeight;
-      if (d.status === 'done')  window.location.href = '/result/' + jobId;
-      else if (d.status === 'error') logEl.innerHTML += '<div style="color:#f85149">❌ Error — check log above</div>';
-      else setTimeout(poll, 2000);
+      if (d.status === 'done') {
+        document.querySelector('.spinner').style.display = 'none';
+        document.querySelector('h2').innerHTML = '✅ Scrape complete!';
+        document.getElementById('view-btn').style.display = 'block';
+      } else if (d.status === 'error') {
+        document.querySelector('.spinner').style.display = 'none';
+        logEl.innerHTML += '<div style="color:#f85149">❌ Error — check log above</div>';
+      } else setTimeout(poll, 2000);
     })
     .catch(() => setTimeout(poll, 3000));
 }
