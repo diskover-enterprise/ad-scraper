@@ -89,11 +89,29 @@ def extract_urls(ad):
     imgs, vids = [], []
     snap = ad.get("snapshot") or {}
 
-    # Top-level images
-    for key in ("resized_image_url", "original_image_url"):
-        v = snap.get(key) or ad.get(key)
-        if v and v not in imgs:
-            imgs.append(v)
+    # snapshot.images[] — array of image objects (most common format)
+    for img_obj in snap.get("images", []):
+        if isinstance(img_obj, dict):
+            for key in ("resized_image_url", "original_image_url"):
+                v = img_obj.get(key)
+                if v and v not in imgs:
+                    imgs.append(v)
+        elif isinstance(img_obj, str) and img_obj not in imgs:
+            imgs.append(img_obj)
+
+    # snapshot.videos[] — array of video objects
+    for vid_obj in snap.get("videos", []):
+        if isinstance(vid_obj, dict):
+            for key in ("video_hd_url", "video_sd_url"):
+                v = vid_obj.get(key)
+                if v and v not in vids:
+                    vids.append(v)
+            # Video preview as image fallback
+            prev = vid_obj.get("video_preview_image_url")
+            if prev and prev not in imgs:
+                imgs.append(prev)
+        elif isinstance(vid_obj, str) and vid_obj not in vids:
+            vids.append(vid_obj)
 
     # Carousel cards
     for card in snap.get("cards", []):
@@ -106,13 +124,17 @@ def extract_urls(ad):
             if v and v not in vids:
                 vids.append(v)
 
-    # Top-level videos
+    # Top-level fallback keys
+    for key in ("resized_image_url", "original_image_url"):
+        v = snap.get(key) or ad.get(key)
+        if v and v not in imgs:
+            imgs.append(v)
     for key in ("video_hd_url", "video_sd_url"):
         v = snap.get(key) or ad.get(key)
         if v and v not in vids:
             vids.append(v)
 
-    # Use video preview as image fallback
+    # Video preview fallback
     if vids and not imgs:
         prev = snap.get("video_preview_image_url") or ad.get("video_preview_image_url")
         if prev:
@@ -203,7 +225,7 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                         f"?active_status={_status}&ad_type=all&country={_country}"
                         f"&q={urlquote(q)}&search_type=keyword_unordered&media_type=all"
                     )}
-                    for q in queries if q
+                    for q in queries if q.strip()
                 ]
                 if i == 0:
                     # Domain search: find all advertisers running ads to this domain
@@ -741,9 +763,6 @@ input:focus,select:focus{border-color:#1877f2;box-shadow:0 0 0 3px rgba(24,119,2
   <p class="sub">Scrape Facebook & Instagram ads via the Meta Ad Library</p>
 
   <form method="POST" action="/start">
-    <label>Brand Name</label>
-    <input name="brand" placeholder="e.g. NovaBurn" required>
-
     <div class="two-col">
       <div>
         <label>Country</label>
@@ -846,13 +865,13 @@ def home():
 
 @app.route("/start", methods=["POST"])
 def start():
-    brand        = request.form.get("brand", "Brand").strip()
     country      = request.form.get("country", "US")
     ad_status    = request.form.get("ad_status", "active")
     domain_input = request.form.get("domain", "").strip()
     page_url     = request.form.get("page_url", "").strip()
     searches_raw = request.form.getlist("search[]")
     searches     = [[q.strip() for q in s.split(",") if q.strip()] for s in searches_raw if s.strip()]
+    brand        = domain_input or page_url or "Meta Ads"  # label for results page only
 
     # Extract clean domain
     domain = ""
@@ -860,9 +879,9 @@ def start():
         raw = domain_input if "://" in domain_input else "https://" + domain_input
         domain = urlparse(raw).netloc
 
-    # Fallback: use brand name if no keywords entered
+    # If domain/page_url provided but no keywords, fire one thread with just those
     if not searches:
-        searches = [[brand]]
+        searches = [[]]
 
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "running", "log": [], "html": None}
