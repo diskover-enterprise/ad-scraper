@@ -762,7 +762,7 @@ input:focus,select:focus{border-color:#1877f2;box-shadow:0 0 0 3px rgba(24,119,2
     </div>
 
     <div class="divider">
-      <label>Brand Website <span style="font-weight:normal;color:#aaa">(optional — finds all advertisers driving traffic to this domain)</span></label>
+      <label>Landing Page / Domain <span style="font-weight:normal;color:#aaa">(optional — finds all advertisers driving traffic to this domain)</span></label>
       <input name="domain" placeholder="e.g. get-novaburn.com">
 
       <label style="margin-top:14px">Competitor Facebook Page URL <span style="font-weight:normal;color:#aaa">(optional)</span></label>
