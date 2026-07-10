@@ -172,7 +172,7 @@ def normalize_ad(ad):
             if landing:
                 break
 
-    ad_id   = str(ad.get("adArchiveID") or ad.get("ad_archive_id") or "")
+    ad_id   = str(ad.get("adArchiveID") or ad.get("ad_archive_id") or ad.get("archiveID") or ad.get("id") or "")
     lib_url = f"https://www.facebook.com/ads/library/?id={ad_id}" if ad_id else "#"
 
     # Impressions index → human range
@@ -243,7 +243,7 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                     results[i] = []
                     return
 
-                run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15})
+                run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15, "scrapeAdDetails": True})
                 run_id = run["data"]["id"]
                 ads    = wait_for_run(run_id, log)
                 log(f"   ✓ {len(ads)} ads returned from dataset")
