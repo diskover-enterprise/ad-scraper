@@ -269,7 +269,8 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                     log(f"   DEBUG top-level keys: {list(ads[0].keys())}")
                     log(f"   DEBUG snapshot keys: {list(snap.keys())}")
                     log(f"   DEBUG images: {json.dumps(snap.get('images') or [])[:600]}")
-                    log(f"   DEBUG videos: {json.dumps(snap.get('videos') or [])[:600]}")
+                    log(f"   DEBUG video[0] keys: {list((snap.get('videos') or [{}])[0].keys()) if snap.get('videos') else []}")
+                    log(f"   DEBUG video[0]: {json.dumps((snap.get('videos') or [{}])[0])[:800]}")
                     log(f"   DEBUG extra_images: {json.dumps(snap.get('extra_images') or [])[:400]}")
                 results[i] = ads
             except Exception as e:
@@ -325,16 +326,25 @@ def build_viewer(brand, country, ads):
         except: lp_host = lp
 
         # Media block
+        def pimg(u): return f"/img?u={urlquote(u)}"
         if vids:
             dl_links = " ".join(
-                f'<a href="{v}" target="_blank" class="vid-dl">⬇ Video {i+1}</a>'
+                f'<a href="{v}" target="_blank" class="vid-dl">▶ Watch Video {i+1}</a>'
                 for i, v in enumerate(vids[:3]))
-            media = (f'<div class="media-wrap">'
-                     f'<video controls preload="metadata" src="{vids[0]}" ></video>'
-                     f'<div class="vid-dl-row">{dl_links}</div></div>')
+            if imgs:
+                # Show proxied thumbnail + watch link
+                thumb_html = f'<img src="{pimg(imgs[0])}" style="width:100%;max-height:320px;object-fit:contain;display:block;cursor:pointer" onclick="window.open(\'{vids[0]}\',\'_blank\')">'
+                media = (f'<div class="media-wrap">'
+                         f'{thumb_html}'
+                         f'<div class="vid-dl-row">{dl_links}</div></div>')
+            else:
+                # No thumbnail — just show watch links
+                media = (f'<div class="media-wrap" style="background:#111;min-height:120px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:16px">'
+                         f'<span style="font-size:36px">🎬</span>'
+                         f'<div class="vid-dl-row" style="justify-content:center">{dl_links}</div></div>')
         elif imgs:
             img_html = "".join(
-                f'<img src="{img}" onclick="openFull(this.src)" >'
+                f'<img src="{pimg(img)}" onclick="openFull(\'{pimg(img)}\')">'
                 for img in imgs[:4])
             media = (f'<div class="media-wrap img-grid img-count-{min(len(imgs),4)}">'
                      f'{img_html}</div>')
@@ -412,10 +422,11 @@ def build_viewer(brand, country, ads):
         adv_slug   = (n["name"] or "").replace('"', "'")
         body_slug  = (n["body"] or "").replace('"', "'").replace('\n', ' ')[:200]
 
+        def pimg(u): return f"/img?u={urlquote(u)}"
         if vids:
             media_cell = f'<video src="{vids[0]}" class="table-thumb" controls></video>'
         elif thumb:
-            media_cell = f'<img src="{thumb}" class="table-thumb" onclick="openFull(this.src)">'
+            media_cell = f'<img src="{pimg(thumb)}" class="table-thumb" onclick="openFull(\'{pimg(thumb)}\')">'
         else:
             media_cell = "—"
 
@@ -939,6 +950,29 @@ def start():
 def status(job_id):
     job = jobs.get(job_id, {})
     return jsonify({"status": job.get("status", "unknown"), "log": job.get("log", [])})
+
+@app.route("/img")
+def proxy_img():
+    """Server-side proxy for Facebook CDN images.
+    Facebook signed URLs (oh= hash) are tied to the requester's session/IP.
+    Fetching server-side avoids browser-level auth failures.
+    """
+    url = request.args.get("u", "")
+    if not url or "fbcdn.net" not in url:
+        return "", 400
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.facebook.com/",
+        })
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read()
+            ct   = r.headers.get("Content-Type", "image/jpeg")
+        resp = app.response_class(data, mimetype=ct)
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        return resp
+    except Exception:
+        return "", 502
 
 @app.route("/logs")
 @app.route("/logs/<job_id>")
