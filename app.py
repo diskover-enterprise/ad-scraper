@@ -330,18 +330,27 @@ def build_viewer(brand, country, ads):
                 f'<a href="{v}" target="_blank" class="vid-dl">⬇ Video {i+1}</a>'
                 for i, v in enumerate(vids[:3]))
             media = (f'<div class="media-wrap">'
-                     f'<video controls preload="metadata" src="{vids[0]}" crossorigin="anonymous"></video>'
+                     f'<video controls preload="metadata" src="{vids[0]}" ></video>'
                      f'<div class="vid-dl-row">{dl_links}</div></div>')
         elif imgs:
             img_html = "".join(
-                f'<img src="{img}" onclick="openFull(this.src)" crossorigin="anonymous">'
+                f'<img src="{img}" onclick="openFull(this.src)" >'
                 for img in imgs[:4])
             media = (f'<div class="media-wrap img-grid img-count-{min(len(imgs),4)}">'
                      f'{img_html}</div>')
         else:
-            icon  = "🎬" if fmt == "VIDEO" else "🖼️"
-            media = (f'<div class="media-placeholder"><span>{icon}</span>'
-                     f'<a href="{lib_url}" target="_blank">View in Ad Library →</a></div>')
+            gated   = ad.get("gated_type") or ""
+            is_sens = ad.get("contains_sensitive_content")
+            if gated:
+                reason = "🔞 Age/sensitivity restricted — creative withheld by Meta"
+            elif not ad.get("is_active"):
+                reason = "⏸ Inactive ad — creative not served by Meta API"
+            elif is_sens:
+                reason = "⚠️ Sensitive content — creative withheld by Meta"
+            else:
+                reason = "🖼️ No creative returned"
+            media = (f'<div class="media-placeholder"><span style="font-size:13px;color:#999;text-align:center;padding:0 12px">{reason}</span>'
+                     f'<a href="{lib_url}" target="_blank" style="margin-top:6px">View in Ad Library →</a></div>')
 
         body_html  = (n["body"]  or "").replace('"', '&quot;').replace('\n', '<br>')
         title_html = (n["title"] or "").replace('"', '&quot;')
