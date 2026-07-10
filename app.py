@@ -268,7 +268,9 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                     snap = ads[0].get("snapshot") or {}
                     log(f"   DEBUG top-level keys: {list(ads[0].keys())}")
                     log(f"   DEBUG snapshot keys: {list(snap.keys())}")
-                    log(f"   DEBUG first ad raw: {json.dumps(ads[0])[:800]}")
+                    log(f"   DEBUG images: {json.dumps(snap.get('images') or [])[:600]}")
+                    log(f"   DEBUG videos: {json.dumps(snap.get('videos') or [])[:600]}")
+                    log(f"   DEBUG extra_images: {json.dumps(snap.get('extra_images') or [])[:400]}")
                 results[i] = ads
             except Exception as e:
                 log(f"   ✗ Error: {e}")
