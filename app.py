@@ -264,14 +264,6 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status):
                 run_id = run["data"]["id"]
                 ads    = wait_for_run(run_id, log)
                 log(f"   ✓ {len(ads)} ads returned from dataset")
-                if ads:
-                    snap = ads[0].get("snapshot") or {}
-                    log(f"   DEBUG top-level keys: {list(ads[0].keys())}")
-                    log(f"   DEBUG snapshot keys: {list(snap.keys())}")
-                    log(f"   DEBUG images: {json.dumps(snap.get('images') or [])[:600]}")
-                    log(f"   DEBUG video[0] keys: {list((snap.get('videos') or [{}])[0].keys()) if snap.get('videos') else []}")
-                    log(f"   DEBUG video[0]: {json.dumps((snap.get('videos') or [{}])[0])[:800]}")
-                    log(f"   DEBUG extra_images: {json.dumps(snap.get('extra_images') or [])[:400]}")
                 results[i] = ads
             except Exception as e:
                 log(f"   ✗ Error: {e}")
