@@ -16,7 +16,8 @@ last_job_id = None  # track most recent job for /logs endpoint
 # ── Config ───────────────────────────────────────────────────────────────────
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
-META_ACTOR  = "XtaWFhbtfxyzqrFmd"  # curious_coder/facebook-ads-library-scraper
+META_ACTOR  = "XtaWFhbtfxyzqrFmd"   # curious_coder/facebook-ads-library-scraper (unauthenticated)
+AUTH_ACTOR  = os.environ.get("AUTH_ACTOR_ID", "")  # your custom meta-ads-auth-scraper actor ID
 APIFY_BASE  = "https://api.apify.com/v2"
 
 COUNTRIES = [
@@ -222,153 +223,36 @@ def normalize_ad(ad):
     }
 
 
-# ── Authenticated Meta scraper ────────────────────────────────────────────────
+# ── Authenticated Meta scraper (custom Apify actor) ───────────────────────────
 
 def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     """
-    Direct authenticated scrape via Meta's internal Ad Library API.
-    Bypasses curious_coder — uses the user's own Facebook session cookies.
-    Returns ads in snake_case format compatible with the rest of the app.
+    Authenticated scrape via a custom Apify Playwright actor.
+    The actor runs on Apify's infrastructure (handles proxies + fingerprinting)
+    and injects the user's Facebook session cookies to unlock LOGGED_OUT creatives.
     """
-    log("  🔐 Authenticated mode — using Facebook session cookies")
-
-    # Build cookie jar from Cookie-Editor JSON export
-    jar = {}
-    for c in cookies_list:
-        n = c.get("name") or c.get("Name", "")
-        v = c.get("value") or c.get("Value", "")
-        if n and v:
-            jar[n] = v
-
-    cookie_header = "; ".join(f"{k}={v}" for k, v in jar.items())
-
-    # Route through Apify residential proxy — Railway's data center IP gets 403'd by Facebook
-    proxy_host = "proxy.apify.com:8000"
-    proxy_handler = urllib.request.ProxyHandler({
-        "http":  f"http://{proxy_host}",
-        "https": f"http://{proxy_host}",
-    })
-    pwd_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-    pwd_mgr.add_password(None, proxy_host, "auto", APIFY_TOKEN)
-    proxy_auth = urllib.request.ProxyBasicAuthHandler(pwd_mgr)
-    opener = urllib.request.build_opener(proxy_handler, proxy_auth)
-
-    def fb_get(url, extra_headers=None):
-        hdrs = {
-            "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept":           "*/*",
-            "Accept-Language":  "en-US,en;q=0.9",
-            "Referer":          "https://www.facebook.com/ads/library/",
-            "X-Requested-With": "XMLHttpRequest",
-            "Cookie":           cookie_header,
-        }
-        if extra_headers:
-            hdrs.update(extra_headers)
-        req = urllib.request.Request(url, headers=hdrs)
-        with opener.open(req, timeout=30) as r:
-            return r.read().decode("utf-8", errors="replace")
-
-    # Fetch LSD CSRF token from the Ad Library page
-    try:
-        html  = fb_get("https://www.facebook.com/ads/library/")
-        lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', html)
-        lsd   = lsd_m.group(1) if lsd_m else ""
-        log(f"  🔐 LSD token: {'✓' if lsd else '✗ not found — check cookies'}")
-    except Exception as e:
-        log(f"  ❌ Could not load Ad Library page: {e}")
+    if not AUTH_ACTOR:
+        log("  ❌ AUTH_ACTOR_ID env var not set — deploy the meta-auth-actor first")
         return []
 
-    all_ads = []
-
-    for url_obj in search_urls:
-        src_url = url_obj.get("url", "")
-        if not src_url:
-            continue
-
-        parsed = urlparse(src_url)
-        qs     = parse_qs(parsed.query)
-
-        params = {
-            "count":         str(count),
-            "active_status": ad_status,
-            "ad_type":       "all",
-            "media_type":    "all",
-            "__a":           "1",
-            "lsd":           lsd,
-        }
-
-        if "facebook.com/ads/library" in src_url:
-            params["search_type"] = qs.get("search_type", ["keyword_unordered"])[0]
-            if "q"       in qs: params["q"]          = qs["q"][0]
-            if "country" in qs: params["country[0]"] = qs["country"][0]
-            else:               params["country[0]"] = country or "US"
-        else:
-            pid_m = re.search(r"(?:id=|/)(\d{10,})", src_url)
-            if pid_m:
-                params["view_all_page_id"] = pid_m.group(1)
-            params["country[0]"] = country or "US"
-
-        qs_str   = "&".join(f"{k}={urlquote(str(v))}" for k, v in params.items())
-        api_url  = f"https://www.facebook.com/ads/library/async/search_ads/?{qs_str}"
-
-        try:
-            text = fb_get(api_url, extra_headers={"X-FB-LSD": lsd})
-            if text.startswith("for(;;);"):
-                text = text[8:]
-            data = json.loads(text)
-
-            results = []
-            payload = data.get("payload", data)
-            if isinstance(payload, list):
-                results = payload
-            elif isinstance(payload, dict):
-                results = payload.get("results", payload.get("data", []))
-
-            log(f"  🔐 {len(results)} ads from Meta API")
-            if results and isinstance(results[0], dict):
-                log(f"  🔐 result[0] keys: {list(results[0].keys())[:12]}")
-
-            for ad in results:
-                all_ads.append(_norm_meta_api(ad))
-
-        except Exception as e:
-            log(f"  ❌ Meta API call failed: {e}")
-
-    return all_ads
-
-
-def _norm_meta_api(ad):
-    """
-    Convert Meta's internal API ad dict to the snake_case format
-    that curious_coder uses (and that normalize_ad / extract_urls expect).
-    Field names are guessed from known Meta API patterns; debug logging
-    will reveal the real names on first run.
-    """
-    snap = ad.get("snapshot") or ad.get("adData") or {}
-
-    # Try both camelCase (Meta internal) and snake_case (already normalised)
-    def g(*keys):
-        for k in keys:
-            v = ad.get(k) or snap.get(k)
-            if v is not None:
-                return v
-        return None
-
-    return {
-        "ad_archive_id":        str(g("adArchiveID", "ad_archive_id") or ""),
-        "is_active":            bool(g("isActive", "is_active")),
-        "page_name":            g("pageName", "page_name") or "",
-        "start_date":           g("startDate", "start_date") or "",
-        "end_date":             g("endDate", "end_date") or "",
-        "publisher_platform":   g("publisherPlatform", "publisher_platform") or [],
-        "collation_count":      int(g("collationCount", "collation_count") or 0),
-        "impressions_with_index": g("impressionsWithIndex", "impressions_with_index") or {},
-        "gated_type":           "ELIGIBLE",   # authenticated — creatives should be visible
-        "contains_sensitive_content": False,
-        "snapshot":             snap,
-        "ad_library_url":       g("adLibraryUrl", "ad_library_url") or
-                                f"https://www.facebook.com/ads/library/?id={g('adArchiveID','ad_archive_id') or ''}",
-    }
+    log(f"  🔐 Authenticated mode — running actor {AUTH_ACTOR}")
+    try:
+        run = api_post(f"acts/{AUTH_ACTOR}/runs", {
+            "urls":    search_urls,
+            "cookies": cookies_list,
+            "count":   count,
+        })
+        run_id = run["data"]["id"]
+        ads = wait_for_run(run_id, log)
+        log(f"  🔐 {len(ads)} ads from auth actor")
+        # Actor returns same snake_case format as curious_coder
+        # but force gated_type to ELIGIBLE since we're authenticated
+        for ad in ads:
+            ad["gated_type"] = "ELIGIBLE"
+        return ads
+    except Exception as e:
+        log(f"  ❌ Auth actor failed: {e}")
+        return []
 
 
 # ── Scrape worker ─────────────────────────────────────────────────────────────
