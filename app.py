@@ -243,9 +243,15 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     cookie_header = "; ".join(f"{k}={v}" for k, v in jar.items())
 
     # Route through Apify residential proxy — Railway's data center IP gets 403'd by Facebook
-    apify_proxy = f"http://auto:{APIFY_TOKEN}@proxy.apify.com:8000"
-    proxy_handler = urllib.request.ProxyHandler({"http": apify_proxy, "https": apify_proxy})
-    opener = urllib.request.build_opener(proxy_handler)
+    proxy_host = "proxy.apify.com:8000"
+    proxy_handler = urllib.request.ProxyHandler({
+        "http":  f"http://{proxy_host}",
+        "https": f"http://{proxy_host}",
+    })
+    pwd_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    pwd_mgr.add_password(None, proxy_host, "auto", APIFY_TOKEN)
+    proxy_auth = urllib.request.ProxyBasicAuthHandler(pwd_mgr)
+    opener = urllib.request.build_opener(proxy_handler, proxy_auth)
 
     def fb_get(url, extra_headers=None):
         hdrs = {
