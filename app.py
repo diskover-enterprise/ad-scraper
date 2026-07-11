@@ -242,19 +242,24 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in jar.items())
 
-    base_headers = {
-        "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept":          "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer":         "https://www.facebook.com/ads/library/",
-        "Origin":          "https://www.facebook.com",
-        "X-Requested-With": "XMLHttpRequest",
-        "Cookie":          cookie_header,
-    }
+    # Route through Apify residential proxy — Railway's data center IP gets 403'd by Facebook
+    apify_proxy = f"http://auto:{APIFY_TOKEN}@proxy.apify.com:8000"
+    proxy_handler = urllib.request.ProxyHandler({"http": apify_proxy, "https": apify_proxy})
+    opener = urllib.request.build_opener(proxy_handler)
 
-    def fb_get(url):
-        req = urllib.request.Request(url, headers=base_headers)
-        with urllib.request.urlopen(req, timeout=30) as r:
+    def fb_get(url, extra_headers=None):
+        hdrs = {
+            "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept":           "*/*",
+            "Accept-Language":  "en-US,en;q=0.9",
+            "Referer":          "https://www.facebook.com/ads/library/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Cookie":           cookie_header,
+        }
+        if extra_headers:
+            hdrs.update(extra_headers)
+        req = urllib.request.Request(url, headers=hdrs)
+        with opener.open(req, timeout=30) as r:
             return r.read().decode("utf-8", errors="replace")
 
     # Fetch LSD CSRF token from the Ad Library page
@@ -263,7 +268,6 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
         lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', html)
         lsd   = lsd_m.group(1) if lsd_m else ""
         log(f"  🔐 LSD token: {'✓' if lsd else '✗ not found — check cookies'}")
-        base_headers["X-FB-LSD"] = lsd
     except Exception as e:
         log(f"  ❌ Could not load Ad Library page: {e}")
         return []
@@ -302,7 +306,7 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
         api_url  = f"https://www.facebook.com/ads/library/async/search_ads/?{qs_str}"
 
         try:
-            text = fb_get(api_url)
+            text = fb_get(api_url, extra_headers={"X-FB-LSD": lsd})
             if text.startswith("for(;;);"):
                 text = text[8:]
             data = json.loads(text)
