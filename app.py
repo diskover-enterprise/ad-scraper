@@ -230,7 +230,6 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     Bypasses curious_coder — uses the user's own Facebook session cookies.
     Returns ads in snake_case format compatible with the rest of the app.
     """
-    import requests as rq  # lazy import — not needed unless auth mode is used
     log("  🔐 Authenticated mode — using Facebook session cookies")
 
     # Build cookie jar from Cookie-Editor JSON export
@@ -241,25 +240,30 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
         if n and v:
             jar[n] = v
 
-    sess = rq.Session()
-    sess.cookies.update(jar)
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "*/*",
+    cookie_header = "; ".join(f"{k}={v}" for k, v in jar.items())
+
+    base_headers = {
+        "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept":          "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.facebook.com/ads/library/",
-        "Origin": "https://www.facebook.com",
+        "Referer":         "https://www.facebook.com/ads/library/",
+        "Origin":          "https://www.facebook.com",
         "X-Requested-With": "XMLHttpRequest",
-    })
+        "Cookie":          cookie_header,
+    }
+
+    def fb_get(url):
+        req = urllib.request.Request(url, headers=base_headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode("utf-8", errors="replace")
 
     # Fetch LSD CSRF token from the Ad Library page
     try:
-        r = sess.get("https://www.facebook.com/ads/library/", timeout=20)
-        lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', r.text)
-        lsd = lsd_m.group(1) if lsd_m else ""
-        log(f"  🔐 LSD token: {'✓' if lsd else '✗ not found (cookies may be invalid)'}")
-        if lsd:
-            sess.headers["X-FB-LSD"] = lsd
+        html  = fb_get("https://www.facebook.com/ads/library/")
+        lsd_m = re.search(r'"LSD",\[\],\{"token":"([^"]+)"', html)
+        lsd   = lsd_m.group(1) if lsd_m else ""
+        log(f"  🔐 LSD token: {'✓' if lsd else '✗ not found — check cookies'}")
+        base_headers["X-FB-LSD"] = lsd
     except Exception as e:
         log(f"  ❌ Could not load Ad Library page: {e}")
         return []
@@ -267,15 +271,15 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     all_ads = []
 
     for url_obj in search_urls:
-        url = url_obj.get("url", "")
-        if not url:
+        src_url = url_obj.get("url", "")
+        if not src_url:
             continue
 
-        parsed = urlparse(url)
+        parsed = urlparse(src_url)
         qs     = parse_qs(parsed.query)
 
         params = {
-            "count":         count,
+            "count":         str(count),
             "active_status": ad_status,
             "ad_type":       "all",
             "media_type":    "all",
@@ -283,28 +287,26 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
             "lsd":           lsd,
         }
 
-        if "facebook.com/ads/library" in url:
-            # Standard Ad Library search URL
+        if "facebook.com/ads/library" in src_url:
             params["search_type"] = qs.get("search_type", ["keyword_unordered"])[0]
-            if "q" in qs:       params["q"]          = qs["q"][0]
+            if "q"       in qs: params["q"]          = qs["q"][0]
             if "country" in qs: params["country[0]"] = qs["country"][0]
             else:               params["country[0]"] = country or "US"
         else:
-            # Facebook page URL — extract numeric page ID
-            pid_m = re.search(r"(?:id=|/)(\d{10,})", url)
+            pid_m = re.search(r"(?:id=|/)(\d{10,})", src_url)
             if pid_m:
                 params["view_all_page_id"] = pid_m.group(1)
             params["country[0]"] = country or "US"
 
+        qs_str   = "&".join(f"{k}={urlquote(str(v))}" for k, v in params.items())
+        api_url  = f"https://www.facebook.com/ads/library/async/search_ads/?{qs_str}"
+
         try:
-            r    = sess.get("https://www.facebook.com/ads/library/async/search_ads/",
-                            params=params, timeout=30)
-            text = r.text
+            text = fb_get(api_url)
             if text.startswith("for(;;);"):
                 text = text[8:]
             data = json.loads(text)
 
-            # Meta wraps results differently depending on search type
             results = []
             payload = data.get("payload", data)
             if isinstance(payload, list):
@@ -316,7 +318,6 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
             if results and isinstance(results[0], dict):
                 log(f"  🔐 result[0] keys: {list(results[0].keys())[:12]}")
 
-            # Normalise to snake_case so the rest of the app works unchanged
             for ad in results:
                 all_ads.append(_norm_meta_api(ad))
 
