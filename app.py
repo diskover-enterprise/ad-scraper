@@ -195,12 +195,14 @@ def normalize_ad(ad):
 
     # Impressions index → human range
     impressions = ""
+    imp_idx = -1
     imp = ad.get("impressions_with_index") or {}
     if isinstance(imp, dict):
         idx    = imp.get("impressionsIndex", -1)
         ranges = ["<1K", "1K–5K", "5K–20K", "20K–50K", "50K–100K", "100K–500K", "500K–1M", ">1M"]
         if 0 <= idx < len(ranges):
             impressions = ranges[idx]
+            imp_idx = idx
 
     variants = ad.get("collation_count", 0) or 0
 
@@ -217,6 +219,7 @@ def normalize_ad(ad):
         "landing":     landing,
         "lib_url":     lib_url,
         "impressions": impressions,
+        "imp_idx":     imp_idx,
         "variants":    int(variants),
         "plats":       plats,
         "ad_id":       ad_id,
@@ -416,7 +419,7 @@ def build_viewer(brand, country, ads):
         return (
             f'<div class="card" data-status="{n["status"]}" data-fmt="{fmt}"'
             f' data-advertiser="{adv_slug}" data-body="{body_slug}" data-title="{ttl_slug}"'
-            f' data-date="{n["date"]}" data-cta="{cta}" data-lp="{lp_slug}" data-lib="{lib_slug}">'
+            f' data-date="{n["date"]}" data-imp="{n["imp_idx"]}" data-cta="{cta}" data-lp="{lp_slug}" data-lib="{lib_slug}">'
             f'<div class="card-header">'
             f'<div class="card-name">{n["name"]}</div>'
             f'<div class="card-meta">{n["date"]} · {n["plats"]}</div>'
@@ -605,6 +608,7 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   <input id="srch" class="search-box" placeholder="Search advertiser or copy…" oninput="applyFilters()">
   <select class="sort-sel" onchange="sortCards(this.value)">
     <option value="">Sort: default</option>
+    <option value="imp_desc">Impressions ↓</option>
     <option value="date_desc">Newest first</option>
     <option value="date_asc">Oldest first</option>
     <option value="advertiser">Advertiser A–Z</option>
@@ -695,6 +699,7 @@ function sortCards(by) {{
     if (by === 'advertiser') return (a.dataset.advertiser||'').localeCompare(b.dataset.advertiser||'');
     if (by === 'date_desc')  return (b.dataset.date||'').localeCompare(a.dataset.date||'');
     if (by === 'date_asc')   return (a.dataset.date||'').localeCompare(b.dataset.date||'');
+    if (by === 'imp_desc')   return parseInt(b.dataset.imp||-1) - parseInt(a.dataset.imp||-1);
     return 0;
   }});
   cards.forEach(c => grid.appendChild(c));
