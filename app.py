@@ -424,11 +424,15 @@ def build_viewer(brand, country, ads):
         cp_text   = f"{n['title'] or ''}\n\n{n['body'] or ''}".strip().replace('"', "'")[:600]
         lp_slug   = lp.replace('"', "'")
         lib_slug  = lib_url.replace('"', "'")
+        imgs_attr = ",".join(f"/img?u={urlquote(img)}" for img in imgs[:4])
+        vids_attr = ",".join(f"/vid?u={urlquote(v)}" for v in vids[:3])
 
         return (
             f'<div class="card" data-status="{n["status"]}" data-fmt="{fmt}"'
             f' data-advertiser="{adv_slug}" data-body="{body_slug}" data-title="{ttl_slug}"'
-            f' data-date="{n["date"]}" data-imp="{n["imp_idx"]}" data-cta="{cta}" data-lp="{lp_slug}" data-lib="{lib_slug}">'
+            f' data-date="{n["date"]}" data-imp="{n["imp_idx"]}" data-cta="{cta}" data-lp="{lp_slug}" data-lib="{lib_slug}"'
+            f' data-imgs="{imgs_attr}" data-vids="{vids_attr}">'
+            f'<label class="card-cb-wrap" onclick="event.stopPropagation()"><input type="checkbox" class="card-cb" onchange="toggleSelect(this)"></label>'
             f'<div class="card-header">'
             f'<div class="card-name">{n["name"]}</div>'
             f'<div class="card-meta">{n["date"]} · {n["plats"]}</div>'
@@ -591,6 +595,18 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
 #lb{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:999;align-items:center;justify-content:center;cursor:zoom-out}}
 #lb.open{{display:flex}}
 #lb img{{max-width:92vw;max-height:92vh;border-radius:8px}}
+/* ── Selection */
+.card{{position:relative}}
+.card-cb-wrap{{position:absolute;top:8px;left:8px;z-index:10;line-height:0}}
+.card-cb{{width:18px;height:18px;cursor:pointer;accent-color:{C}}}
+.card.selected{{outline:2px solid {C};outline-offset:-2px;background:#f0f6ff}}
+/* ── Bulk action bar */
+.sel-bar{{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:white;padding:10px 20px;border-radius:28px;display:flex;align-items:center;gap:10px;box-shadow:0 4px 24px rgba(0,0,0,.4);z-index:200;font-size:13px;white-space:nowrap;transition:opacity .2s}}
+.sel-bar.hidden{{display:none}}
+.sel-bar-btn{{background:rgba(255,255,255,.15);color:white;border:1px solid rgba(255,255,255,.25);border-radius:16px;padding:5px 14px;cursor:pointer;font-size:12px;font-weight:bold}}
+.sel-bar-btn:hover{{background:rgba(255,255,255,.25)}}
+.sel-bar-btn.primary{{background:{C};border-color:{C}}}
+.sel-bar-btn.primary:hover{{background:#1565c0}}
 </style>
 </head><body>
 
@@ -614,10 +630,11 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   <button class="fbtn" onclick="setFilter('VIDEO',this)">📹 Video</button>
   <button class="fbtn" onclick="setFilter('IMAGE',this)">🖼 Image</button>
   <button class="fbtn" id="gbtn" onclick="toggleGroup(this)">⊞ Group</button>
+  <button class="fbtn" id="selbtn" onclick="toggleSelectMode(this)">☐ Select</button>
   <input id="srch" class="search-box" placeholder="Search advertiser or copy…" oninput="applyFilters()">
   <select class="sort-sel" onchange="sortCards(this.value)">
     <option value="">Sort: default</option>
-    <option value="imp_desc">Impressions ↓</option>
+    <option value="imp_desc" selected>Impressions ↓</option>
     <option value="date_desc">Newest first</option>
     <option value="date_asc">Oldest first</option>
     <option value="advertiser">Advertiser A–Z</option>
@@ -647,11 +664,24 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   </table>
 </div>
 
+<div id="sel-bar" class="sel-bar hidden">
+  <span id="sel-count">0 selected</span>
+  <button class="sel-bar-btn" onclick="selectAllVisible()">Select All</button>
+  <button class="sel-bar-btn" onclick="clearSel()">Clear</button>
+  <button class="sel-bar-btn" onclick="bulkCSV()">⬇ CSV</button>
+  <button class="sel-bar-btn primary" onclick="bulkZip()">⬇ Download ZIP</button>
+</div>
+
 <div id="lb" onclick="this.classList.remove('open')"><img id="lbi" src=""></div>
 
 <script>
 // ── State
 let curFilter = 'all', curView = 'card';
+let selectMode = false;
+const selected = new Set();
+
+// Default sort: impressions descending
+sortCards('imp_desc');
 
 // ── View toggle
 function setView(v) {{
@@ -797,6 +827,133 @@ function copyText(btn) {{
   }});
 }}
 
+// ── Selection
+function toggleSelectMode(btn) {{
+  selectMode = !selectMode;
+  btn.classList.toggle('on', selectMode);
+  btn.textContent = selectMode ? '✓ Select' : '☐ Select';
+  document.querySelectorAll('.card-cb-wrap').forEach(w => w.style.display = selectMode ? '' : 'none');
+  if (!selectMode) clearSel();
+}}
+
+function toggleSelect(cb) {{
+  const card = cb.closest('.card');
+  if (cb.checked) {{ selected.add(card); card.classList.add('selected'); }}
+  else            {{ selected.delete(card); card.classList.remove('selected'); }}
+  updateSelBar();
+}}
+
+function updateSelBar() {{
+  const bar = document.getElementById('sel-bar');
+  document.getElementById('sel-count').textContent = selected.size + ' selected';
+  bar.classList.toggle('hidden', selected.size === 0);
+}}
+
+function selectAllVisible() {{
+  document.querySelectorAll('.card').forEach(c => {{
+    if (c.style.display === 'none') return;
+    c.classList.add('selected');
+    const cb = c.querySelector('.card-cb');
+    if (cb) cb.checked = true;
+    selected.add(c);
+  }});
+  updateSelBar();
+}}
+
+function clearSel() {{
+  selected.forEach(c => {{ c.classList.remove('selected'); const cb = c.querySelector('.card-cb'); if (cb) cb.checked = false; }});
+  selected.clear();
+  updateSelBar();
+}}
+
+// ── Bulk CSV export
+function bulkCSV() {{
+  const rows = [['Advertiser','Status','Format','Date','Title','Body','CTA','Landing Page','Ad Library URL']];
+  selected.forEach(c => {{
+    rows.push([c.dataset.advertiser||'', c.dataset.status||'', c.dataset.fmt||'', c.dataset.date||'', c.dataset.title||'', c.dataset.body||'', c.dataset.cta||'', c.dataset.lp||'', c.dataset.lib||'']);
+  }});
+  const csv = rows.map(r => r.map(v => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'selected_ads.csv'; a.click();
+}}
+
+// ── Bulk ZIP download — one subfolder per ad with all files
+async function bulkZip() {{
+  if (!selected.size) return;
+  const btn = document.querySelector('.sel-bar-btn.primary');
+  btn.textContent = '⏳ Zipping…';
+  btn.disabled = true;
+
+  const zip = new JSZip();
+  let idx = 0;
+
+  for (const card of selected) {{
+    idx++;
+    const adv    = (card.dataset.advertiser || 'ad').replace(/[^a-z0-9]/gi, '_').slice(0, 30);
+    const folder = zip.folder(`${{idx}}_${{adv}}`);
+
+    const imgs = (card.dataset.imgs || '').split(',').filter(Boolean);
+    const vids = (card.dataset.vids || '').split(',').filter(Boolean);
+
+    // ── Images
+    for (let i = 0; i < imgs.length; i++) {{
+      try {{
+        const r    = await fetch(imgs[i]);
+        const blob = await r.blob();
+        const ext  = blob.type.includes('png') ? 'png' : 'jpg';
+        folder.file(`image${{i+1}}.${{ext}}`, blob);
+      }} catch(e) {{}}
+    }}
+
+    // ── Videos: fetch via server proxy (no CORS)
+    if (vids.length) {{
+      for (let i = 0; i < vids.length; i++) {{
+        try {{
+          const r    = await fetch(vids[i]);
+          const blob = await r.blob();
+          folder.file(`video${{i+1}}.mp4`, blob);
+        }} catch(e) {{
+          folder.file(`video${{i+1}}_url.txt`, vids[i]);
+        }}
+      }}
+    }}
+
+    // ── Ad copy companion file
+    const title   = card.dataset.title   || '';
+    const body    = card.dataset.body    || '';
+    const cta     = card.dataset.cta     || '';
+    const lp      = card.dataset.lp      || '';
+    const libUrl  = card.dataset.lib     || '';
+    const status  = card.dataset.status  || '';
+    const date    = card.dataset.date    || '';
+    const fmt     = card.dataset.fmt     || '';
+
+    const copyText = [
+      `ADVERTISER: ${{card.dataset.advertiser || ''}}`,
+      `STATUS: ${{status}}  |  FORMAT: ${{fmt}}  |  DATE: ${{date}}`,
+      ``,
+      title ? `HEADLINE:\\n${{title}}` : '',
+      ``,
+      `AD COPY:\\n${{body}}`,
+      ``,
+      cta     ? `CTA: ${{cta}}`             : '',
+      lp      ? `LANDING PAGE: ${{lp}}`     : '',
+      libUrl  ? `AD LIBRARY: ${{libUrl}}`   : '',
+    ].filter(l => l !== null).join('\\n').trim();
+
+    folder.file('ad_copy.txt', copyText);
+  }}
+
+  const content = await zip.generateAsync({{ type: 'blob' }});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(content);
+  a.download = 'ads_download.zip'; a.click();
+
+  btn.textContent = '⬇ Download ZIP';
+  btn.disabled = false;
+}}
+
 // ── Lightbox
 function openFull(s) {{ document.getElementById('lbi').src = s; document.getElementById('lb').classList.add('open'); }}
 
@@ -819,6 +976,11 @@ function dlVideo(btn) {{
 }}
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+// Hide checkboxes until Select mode is on
+document.querySelectorAll('.card-cb-wrap').forEach(w => w.style.display = 'none');
+</script>
 </body></html>"""
 
 
@@ -1047,6 +1209,26 @@ def proxy_img():
         with urllib.request.urlopen(req, timeout=15) as r:
             data = r.read()
             ct   = r.headers.get("Content-Type", "image/jpeg")
+        resp = app.response_class(data, mimetype=ct)
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        return resp
+    except Exception:
+        return "", 502
+
+@app.route("/vid")
+def proxy_vid():
+    """Server-side proxy for Facebook CDN videos — bypasses browser CORS."""
+    url = request.args.get("u", "")
+    if not url or "fbcdn.net" not in url:
+        return "", 400
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.facebook.com/",
+        })
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+            ct   = r.headers.get("Content-Type", "video/mp4")
         resp = app.response_class(data, mimetype=ct)
         resp.headers["Cache-Control"] = "public, max-age=3600"
         return resp
