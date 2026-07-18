@@ -198,7 +198,16 @@ def normalize_ad(ad):
     imp_idx = -1
     imp = ad.get("impressions_with_index") or {}
     if isinstance(imp, dict):
-        idx    = imp.get("impressionsIndex", -1)
+        # Facebook returns snake_case; handle both just in case
+        idx = imp.get("impressions_index", imp.get("impressionsIndex", -1))
+        # Fallback: derive index from lower_bound string if index missing
+        if idx == -1 and imp.get("lower_bound"):
+            try:
+                lb = int(str(imp["lower_bound"]).replace(",", ""))
+                thresholds = [1000, 5000, 20000, 50000, 100000, 500000, 1000000]
+                idx = next((i for i, t in enumerate(thresholds) if lb < t), 7)
+            except Exception:
+                pass
         ranges = ["<1K", "1K–5K", "5K–20K", "20K–50K", "50K–100K", "100K–500K", "500K–1M", ">1M"]
         if 0 <= idx < len(ranges):
             impressions = ranges[idx]
@@ -978,7 +987,8 @@ def start():
     page_url     = request.form.get("page_url", "").strip()
     searches_raw = request.form.getlist("search[]")
     searches     = [[q.strip() for q in s.split(",") if q.strip()] for s in searches_raw if s.strip()]
-    brand        = domain_input or page_url or "Meta Ads"  # label for results page only
+    first_kw     = searches_raw[0].strip() if searches_raw else ""
+    brand        = domain_input or page_url or first_kw or "Meta Ads"  # label for results page only
 
     # Extract clean domain (handles full URLs like https://trimrx.com/path?query=1)
     domain = ""
