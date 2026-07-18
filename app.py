@@ -919,6 +919,13 @@ async function bulkZip() {{
       }}
     }}
 
+    // ── Card screenshot (whole card as PNG)
+    try {{
+      const canvas = await html2canvas(card, {{ useCORS: true, allowTaint: true, scale: 2 }});
+      const blob   = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      folder.file('card_screenshot.png', blob);
+    }} catch(e) {{}}
+
     // ── Ad copy companion file
     const title   = card.dataset.title   || '';
     const body    = card.dataset.body    || '';
