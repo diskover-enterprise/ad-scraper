@@ -5,11 +5,6 @@ Deploy on Railway — set APIFY_TOKEN env var.
 """
 
 import json, time, threading, uuid, urllib.request, os, re
-try:
-    import anthropic as _anthropic
-    _anthropic_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-except ImportError:
-    _anthropic_client = None
 from urllib.parse import urlparse, quote as urlquote, parse_qs
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
@@ -284,19 +279,21 @@ _translate_error = None  # captures first API error for surfacing in job log
 
 def translate_text(title, body):
     """Detect language + translate to English via Claude Haiku.
+    Calls the Anthropic API directly with urllib (no SDK dependency).
     Returns (language, translation) or (None, None) if English/unavailable.
     """
     global _translate_error
-    if not _anthropic_client or not os.environ.get("ANTHROPIC_API_KEY"):
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
         return None, None
     text = f"{title}\n\n{body}".strip()
     if not text:
         return None, None
     try:
-        msg = _anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{
+        payload = json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1024,
+            "messages": [{
                 "role": "user",
                 "content": (
                     "Detect the language of this ad copy.\n"
@@ -308,8 +305,22 @@ def translate_text(title, body):
                     f"Ad copy:\n{text}"
                 ),
             }],
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            method="POST",
         )
-        reply = msg.content[0].text.strip()
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+
+        reply = resp["content"][0]["text"].strip()
         if reply.upper().startswith("ENGLISH"):
             return None, None
         language, translation, in_trans = "", "", False
@@ -321,6 +332,15 @@ def translate_text(title, body):
             elif in_trans:
                 translation += line + "\n"
         return language, translation.strip()
+    except urllib.error.HTTPError as e:
+        try:
+            body_err = e.read().decode()
+        except Exception:
+            body_err = ""
+        msg = f"HTTP {e.code}: {body_err[:200]}"
+        print(f"[TRANSLATE] {msg}")
+        _translate_error = msg
+        return None, None
     except Exception as e:
         print(f"[TRANSLATE] error: {e}")
         _translate_error = str(e)
@@ -329,7 +349,7 @@ def translate_text(title, body):
 
 def translate_ads_bulk(ads, log):
     """Translate all non-English ads in parallel threads, storing result on each ad."""
-    if not _anthropic_client or not os.environ.get("ANTHROPIC_API_KEY"):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
         log("  🌐 Translation skipped — ANTHROPIC_API_KEY not set")
         return
 
