@@ -280,10 +280,13 @@ def looks_english(text):
     return ratio >= 0.08
 
 
+_translate_error = None  # captures first API error for surfacing in job log
+
 def translate_text(title, body):
     """Detect language + translate to English via Claude Haiku.
     Returns (language, translation) or (None, None) if English/unavailable.
     """
+    global _translate_error
     if not _anthropic_client or not os.environ.get("ANTHROPIC_API_KEY"):
         return None, None
     text = f"{title}\n\n{body}".strip()
@@ -320,6 +323,7 @@ def translate_text(title, body):
         return language, translation.strip()
     except Exception as e:
         print(f"[TRANSLATE] error: {e}")
+        _translate_error = str(e)
         return None, None
 
 
@@ -353,6 +357,8 @@ def translate_ads_bulk(ads, log):
 
     n_trans = sum(1 for ad in ads if ad.get("_translation"))
     log(f"  🌐 Translated {n_trans} ad(s)")
+    if n_trans == 0 and _translate_error:
+        log(f"  ⚠️ Translation API error: {_translate_error}")
 
 
 # ── Authenticated Meta scraper (custom Apify actor) ───────────────────────────
