@@ -5,6 +5,11 @@ Deploy on Railway — set APIFY_TOKEN env var.
 """
 
 import json, time, threading, uuid, urllib.request, os, re
+try:
+    import anthropic as _anthropic
+    _anthropic_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+except ImportError:
+    _anthropic_client = None
 from urllib.parse import urlparse, quote as urlquote, parse_qs
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
@@ -235,6 +240,121 @@ def normalize_ad(ad):
     }
 
 
+# ── Translation ────────────────────────────────────────────────────────────
+
+# Common English function words — cheap local language guess (no API call)
+_EN_WORDS = {
+    "the", "and", "you", "your", "for", "with", "this", "that", "our", "get",
+    "now", "free", "best", "how", "why", "what", "are", "can", "will", "new",
+    "more", "all", "from", "have", "has", "was", "not", "but", "out", "here",
+    "today", "off", "save", "shop", "buy", "learn", "try", "see", "help",
+}
+
+def looks_english(text):
+    """Cheap heuristic: is this text probably English? Avoids an API call.
+    Returns True if English (skip translation), False if likely foreign.
+    """
+    if not text or not text.strip():
+        return True  # nothing to translate
+
+    # Non-Latin scripts (Arabic, Chinese, Cyrillic, Hebrew, etc.) → definitely foreign
+    for ch in text:
+        o = ord(ch)
+        if (0x0400 <= o <= 0x04FF or   # Cyrillic
+            0x0590 <= o <= 0x05FF or   # Hebrew
+            0x0600 <= o <= 0x06FF or   # Arabic
+            0x4E00 <= o <= 0x9FFF or   # CJK (Chinese/Japanese kanji)
+            0x3040 <= o <= 0x30FF or   # Japanese kana
+            0xAC00 <= o <= 0xD7AF or   # Korean
+            0x0E00 <= o <= 0x0E7F):    # Thai
+            return False
+
+    # Latin script — count how many English function words appear
+    words = re.findall(r"[a-zA-ZÀ-ÿ]+", text.lower())
+    if len(words) < 4:
+        return True  # too short to judge, don't waste an API call
+    hits = sum(1 for w in words if w in _EN_WORDS)
+    ratio = hits / len(words)
+    # If almost no English function words, it's probably a Latin-script foreign
+    # language (Spanish, German, French, etc.) → translate
+    return ratio >= 0.08
+
+
+def translate_text(title, body):
+    """Detect language + translate to English via Claude Haiku.
+    Returns (language, translation) or (None, None) if English/unavailable.
+    """
+    if not _anthropic_client or not os.environ.get("ANTHROPIC_API_KEY"):
+        return None, None
+    text = f"{title}\n\n{body}".strip()
+    if not text:
+        return None, None
+    try:
+        msg = _anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Detect the language of this ad copy.\n"
+                    "If it is English, reply with exactly: ENGLISH\n"
+                    "If it is another language, reply in this exact format:\n"
+                    "LANGUAGE: [detected language name]\n"
+                    "TRANSLATION:\n"
+                    "[full English translation]\n\n"
+                    f"Ad copy:\n{text}"
+                ),
+            }],
+        )
+        reply = msg.content[0].text.strip()
+        if reply.upper().startswith("ENGLISH"):
+            return None, None
+        language, translation, in_trans = "", "", False
+        for line in reply.splitlines():
+            if line.startswith("LANGUAGE:"):
+                language = line.replace("LANGUAGE:", "").strip()
+            elif line.startswith("TRANSLATION:"):
+                in_trans = True
+            elif in_trans:
+                translation += line + "\n"
+        return language, translation.strip()
+    except Exception as e:
+        print(f"[TRANSLATE] error: {e}")
+        return None, None
+
+
+def translate_ads_bulk(ads, log):
+    """Translate all non-English ads in parallel threads, storing result on each ad."""
+    if not _anthropic_client or not os.environ.get("ANTHROPIC_API_KEY"):
+        log("  🌐 Translation skipped — ANTHROPIC_API_KEY not set")
+        return
+
+    def worker(ad):
+        n = normalize_ad(ad)
+        # Local pre-filter — skip English ads before spending an API call
+        if looks_english(f"{n['title']}\n{n['body']}"):
+            return
+        lang, trans = translate_text(n["title"], n["body"])
+        if trans:
+            ad["_translation"] = trans
+            ad["_trans_lang"]  = lang
+
+    # Only spawn threads for ads that fail the English check
+    foreign = [ad for ad in ads
+               if not looks_english(f"{normalize_ad(ad)['title']}\n{normalize_ad(ad)['body']}")]
+    if not foreign:
+        log("  🌐 All ads appear English — translation skipped (no API cost)")
+        return
+
+    log(f"  🌐 {len(foreign)} non-English ad(s) detected — translating…")
+    threads = [threading.Thread(target=worker, args=(ad,)) for ad in foreign]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    n_trans = sum(1 for ad in ads if ad.get("_translation"))
+    log(f"  🌐 Translated {n_trans} ad(s)")
+
+
 # ── Authenticated Meta scraper (custom Apify actor) ───────────────────────────
 
 def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
@@ -335,6 +455,7 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status, cooki
                 unique.append(ad)
 
         log(f"📊 {len(unique)} unique ads")
+        translate_ads_bulk(unique, log)
         job["html"]   = build_viewer(brand, country, unique)
         job["status"] = "done"
         log("✅ Done!")
@@ -424,14 +545,31 @@ def build_viewer(brand, country, ads):
         cp_text   = f"{n['title'] or ''}\n\n{n['body'] or ''}".strip().replace('"', "'")[:600]
         lp_slug   = lp.replace('"', "'")
         lib_slug  = lib_url.replace('"', "'")
-        imgs_attr = ",".join(f"/img?u={urlquote(img)}" for img in imgs[:4])
-        vids_attr = ",".join(f"/vid?u={urlquote(v)}" for v in vids[:3])
+        # Auto-translation (set during scrape for non-English ads)
+        trans      = ad.get("_translation") or ""
+        trans_lang = ad.get("_trans_lang")  or "original language"
+        if trans:
+            t_html   = trans.replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+            trans_html = (
+                f'<div class="card-translation">'
+                f'<div class="trans-lang">🌐 Translated from {trans_lang}:</div>'
+                f'<div class="trans-text">{t_html}</div>'
+                f'</div>'
+            )
+        else:
+            trans_html = ""
+
+        imgs_attr      = ",".join(f"/img?u={urlquote(img)}" for img in imgs[:4])
+        vids_attr      = ",".join(f"/vid?u={urlquote(v)}" for v in vids[:3])
+        orig_imgs_attr = ",".join(imgs[:4])
+        orig_vids_attr = ",".join(vids[:3])
 
         return (
             f'<div class="card" data-status="{n["status"]}" data-fmt="{fmt}"'
             f' data-advertiser="{adv_slug}" data-body="{body_slug}" data-title="{ttl_slug}"'
             f' data-date="{n["date"]}" data-imp="{n["imp_idx"]}" data-cta="{cta}" data-lp="{lp_slug}" data-lib="{lib_slug}"'
-            f' data-imgs="{imgs_attr}" data-vids="{vids_attr}">'
+            f' data-imgs="{imgs_attr}" data-vids="{vids_attr}"'
+            f' data-orig-imgs="{orig_imgs_attr}" data-orig-vids="{orig_vids_attr}">'
             f'<label class="card-cb-wrap" onclick="event.stopPropagation()"><input type="checkbox" class="card-cb" onchange="toggleSelect(this)"></label>'
             f'<div class="card-header">'
             f'<div class="card-name">{n["name"]}</div>'
@@ -456,7 +594,9 @@ def build_viewer(brand, country, ads):
             f'<button class="btn-sm" onclick="copyText(this)" data-text="{cp_text}">📋 Copy</button>'
             f'{f"<button class=btn-sm onclick=dlVideo(this) data-src={vids[0]}>⬇ Video</button>" if vids else ""}'
             f'<button class="btn-sm" onclick="shotCard(this)">📷 Shot</button>'
-            f'</div></div></div>'
+            f'</div></div>'
+            f'{trans_html}'
+            f'</div>'
         )
 
     # ── Table row builder ─────────────────────────────────────────────────────
@@ -607,6 +747,51 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
 .sel-bar-btn:hover{{background:rgba(255,255,255,.25)}}
 .sel-bar-btn.primary{{background:{C};border-color:{C}}}
 .sel-bar-btn.primary:hover{{background:#1565c0}}
+/* ── Generate Modal */
+#gen-modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:400;overflow-y:auto;padding:24px}}
+#gen-modal.open{{display:flex;align-items:flex-start;justify-content:center}}
+.gen-panel{{background:white;border-radius:14px;width:100%;max-width:960px;box-shadow:0 8px 40px rgba(0,0,0,.3);margin:auto}}
+.gen-header{{padding:18px 24px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center}}
+.gen-header h2{{font-size:17px;font-weight:bold}}
+.gen-close{{background:none;border:none;font-size:22px;cursor:pointer;color:#888;line-height:1}}
+.gen-body{{padding:20px 24px;max-height:75vh;overflow-y:auto}}
+.gen-ad-row{{border:1px solid #e0e0e0;border-radius:10px;margin-bottom:16px;overflow:hidden}}
+.gen-ad-top{{display:grid;grid-template-columns:100px 1fr;gap:12px;background:#f7f8fa;padding:12px;align-items:start}}
+.gen-thumb{{width:100px;height:75px;object-fit:cover;border-radius:6px;background:#111;display:block}}
+.gen-ad-info h3{{font-size:13px;font-weight:bold;margin-bottom:3px}}
+.gen-ad-info p{{font-size:11px;color:#666;line-height:1.4;max-height:48px;overflow:hidden;margin:0}}
+.gen-ad-body{{padding:12px}}
+.gen-analysis{{font-size:12px;color:#444;line-height:1.6;background:#f0f6ff;padding:10px 12px;border-radius:6px;margin-bottom:12px;border-left:3px solid {C}}}
+.gen-prompts{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}
+.gen-prompt-wrap label{{font-size:11px;font-weight:bold;color:#555;display:block;margin-bottom:4px}}
+.gen-prompt-wrap textarea{{width:100%;height:72px;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:11px;resize:vertical;outline:none;font-family:inherit;box-sizing:border-box}}
+.gen-prompt-wrap textarea:focus{{border-color:{C}}}
+.gen-row-actions{{display:flex;gap:8px;flex-wrap:wrap}}
+.gbtn{{padding:6px 14px;border:none;border-radius:7px;cursor:pointer;font-size:12px;font-weight:bold;white-space:nowrap}}
+.gbtn:disabled{{opacity:.4;cursor:not-allowed}}
+.gbtn.analyze{{background:#f0f2f5;color:#333}}
+.gbtn.analyze:hover:not(:disabled){{background:#e4e6e9}}
+.gbtn.flux{{background:#6366f1;color:white}}
+.gbtn.flux:hover:not(:disabled){{background:#4f46e5}}
+.gbtn.hf{{background:#f59e0b;color:white}}
+.gbtn.hf:hover:not(:disabled){{background:#d97706}}
+.gen-outputs{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}}
+.gen-out-box{{border:1px solid #e0e0e0;border-radius:8px;overflow:hidden}}
+.gen-out-label{{font-size:10px;font-weight:bold;color:#555;padding:5px 8px;background:#f0f2f5;border-bottom:1px solid #e0e0e0}}
+.gen-out-content{{display:flex;align-items:center;justify-content:center;min-height:120px;background:#fafafa;font-size:12px;color:#aaa;text-align:center;padding:12px}}
+.gen-out-content img,.gen-out-content video{{width:100%;display:block}}
+/* ── Translation */
+.card-translation{{padding:8px 12px;border-top:1px solid #f0f0f0;background:#fffef0;font-size:12px}}
+.card-translation .trans-lang{{font-size:10px;color:#888;font-weight:bold;margin-bottom:3px}}
+.card-translation .trans-text{{color:#444;line-height:1.5}}
+.gen-footer{{padding:14px 24px;border-top:1px solid #eee;display:flex;gap:10px;justify-content:flex-end}}
+.gfbtn{{padding:9px 20px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:bold}}
+.gfbtn.blue{{background:{C};color:white}}
+.gfbtn.blue:hover{{background:#1565c0}}
+.gfbtn.purple{{background:#6366f1;color:white}}
+.gfbtn.purple:hover{{background:#4f46e5}}
+.gfbtn.grey{{background:#f0f2f5;color:#333}}
+.gfbtn.grey:hover{{background:#e4e6e9}}
 </style>
 </head><body>
 
@@ -670,6 +855,22 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   <button class="sel-bar-btn" onclick="clearSel()">Clear</button>
   <button class="sel-bar-btn" onclick="bulkCSV()">⬇ CSV</button>
   <button class="sel-bar-btn primary" onclick="bulkZip()">⬇ Download ZIP</button>
+  <button class="sel-bar-btn" style="background:#6366f1;border-color:#6366f1" onclick="openGenModal()">🎨 Generate</button>
+</div>
+
+<div id="gen-modal">
+  <div class="gen-panel">
+    <div class="gen-header">
+      <h2>🎨 Generate Ad Iterations</h2>
+      <button class="gen-close" onclick="closeGenModal()">✕</button>
+    </div>
+    <div class="gen-body" id="gen-body"></div>
+    <div class="gen-footer">
+      <button class="gfbtn grey" onclick="closeGenModal()">Close</button>
+      <button class="gfbtn blue" onclick="analyzeAll()">🔍 Analyze All</button>
+      <button class="gfbtn purple" onclick="generateAll()">⚡ Generate All</button>
+    </div>
+  </div>
 </div>
 
 <div id="lb" onclick="this.classList.remove('open')"><img id="lbi" src=""></div>
@@ -973,6 +1174,181 @@ function shotCard(btn) {{
   }}).catch(() => alert('Screenshot failed — right-click the image and save directly.'));
 }}
 
+// ── Generate Modal
+function openGenModal() {{
+  if (!selected.size) return;
+  const body = document.getElementById('gen-body');
+  body.innerHTML = '';
+  let idx = 0;
+  for (const card of selected) {{
+    idx++;
+    const id       = (card.dataset.lib || '').match(/id=(\d+)/)?.[1] || idx;
+    const adv      = card.dataset.advertiser || 'Unknown';
+    const fmt      = card.dataset.fmt || 'IMAGE';
+    const bodyTxt  = (card.dataset.body  || '').slice(0, 150);
+    const title    = (card.dataset.title || '');
+    const imgs     = (card.dataset.imgs  || '').split(',').filter(Boolean);
+    const origImgs = (card.dataset.origImgs || '').split(',').filter(Boolean);
+    const origVids = (card.dataset.origVids || '').split(',').filter(Boolean);
+    const thumb    = imgs[0] || '';
+    const safeAdv  = adv.replace(/"/g,"'");
+    const safeTitle = title.replace(/"/g,"'");
+    const safeBody  = bodyTxt.replace(/"/g,"'");
+
+    const row = document.createElement('div');
+    row.className = 'gen-ad-row';
+    row.id = `gen-row-${{id}}`;
+    row.innerHTML = `
+      <div class="gen-ad-top">
+        ${{thumb ? `<img class="gen-thumb" src="${{thumb}}">` : '<div class="gen-thumb"></div>'}}
+        <div class="gen-ad-info">
+          <h3>${{adv}} <span style="font-weight:normal;color:#888">— ${{fmt}}</span></h3>
+          ${{title ? `<p><strong>${{title}}</strong></p>` : ''}}
+          <p>${{bodyTxt}}${{bodyTxt.length >= 150 ? '…' : ''}}</p>
+        </div>
+      </div>
+      <div class="gen-ad-body">
+        <div class="gen-analysis" id="analysis-${{id}}" style="display:none"></div>
+        <div class="gen-prompts" id="prompts-${{id}}" style="display:none">
+          <div class="gen-prompt-wrap">
+            <label>🖼 Flux Prompt (static image)</label>
+            <textarea id="flux-prompt-${{id}}" placeholder="Click Analyze to generate…"></textarea>
+          </div>
+          <div class="gen-prompt-wrap">
+            <label>🎬 Higgsfield Prompt (animation)</label>
+            <textarea id="hf-prompt-${{id}}" placeholder="Click Analyze to generate…"></textarea>
+          </div>
+        </div>
+        <div class="gen-row-actions" style="margin-top:8px">
+          <button class="gbtn analyze"
+            id="analyze-btn-${{id}}"
+            data-id="${{id}}"
+            data-adv="${{safeAdv}}"
+            data-fmt="${{fmt}}"
+            data-title="${{safeTitle}}"
+            data-body="${{safeBody}}"
+            data-orig-imgs="${{origImgs.join(',')}}"
+            data-orig-vids="${{origVids.join(',')}}"
+            onclick="analyzeAd('${{id}}', this)">🔍 Analyze</button>
+          <button class="gbtn flux" id="flux-btn-${{id}}" onclick="generateImage('${{id}}', this)" disabled>🖼 Generate Image</button>
+          <button class="gbtn hf"   id="hf-btn-${{id}}"   onclick="generateVideo('${{id}}', this)"  disabled>🎬 Animate</button>
+        </div>
+        <div class="gen-outputs" id="outputs-${{id}}" style="display:none">
+          <div class="gen-out-box">
+            <div class="gen-out-label">🖼 Flux — Generated Image</div>
+            <div class="gen-out-content" id="flux-out-${{id}}">Not yet generated</div>
+          </div>
+          <div class="gen-out-box">
+            <div class="gen-out-label">🎬 Higgsfield — Animated Video</div>
+            <div class="gen-out-content" id="hf-out-${{id}}">Generate image first</div>
+          </div>
+        </div>
+      </div>`;
+    body.appendChild(row);
+  }}
+  document.getElementById('gen-modal').classList.add('open');
+}}
+
+function closeGenModal() {{
+  document.getElementById('gen-modal').classList.remove('open');
+}}
+
+async function analyzeAd(id, btn) {{
+  btn.textContent = '⏳ Analyzing…';
+  btn.disabled    = true;
+  const payload = {{
+    ad_id:     id,
+    advertiser: btn.dataset.adv,
+    format:    btn.dataset.fmt,
+    title:     btn.dataset.title,
+    body:      btn.dataset.body,
+    orig_imgs: (btn.dataset.origImgs || '').split(',').filter(Boolean),
+    orig_vids: (btn.dataset.origVids || '').split(',').filter(Boolean),
+  }};
+  try {{
+    const r    = await fetch('/analyze', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload) }});
+    const data = await r.json();
+    const el   = document.getElementById(`analysis-${{id}}`);
+    el.innerHTML = `<strong>Visual Style:</strong> ${{data.visual_style}}<br>
+                    <strong>Hook Type:</strong> ${{data.hook_type}}<br>
+                    <strong>Tone:</strong> ${{data.tone}}
+                    ${{data.note ? `<br><em style="color:#888;font-size:11px">⚠️ ${{data.note}}</em>` : ''}}`;
+    el.style.display = 'block';
+    document.getElementById(`flux-prompt-${{id}}`).value = data.flux_prompt;
+    document.getElementById(`hf-prompt-${{id}}`).value   = data.higgsfield_prompt;
+    document.getElementById(`prompts-${{id}}`).style.display  = 'grid';
+    document.getElementById(`outputs-${{id}}`).style.display  = 'grid';
+    document.getElementById(`flux-btn-${{id}}`).disabled = false;
+    btn.textContent = '✓ Analyzed';
+  }} catch(e) {{
+    btn.textContent = '❌ Error — retry';
+    btn.disabled = false;
+  }}
+}}
+
+async function generateImage(id, btn) {{
+  const prompt = document.getElementById(`flux-prompt-${{id}}`).value;
+  btn.textContent = '⏳ Generating…';
+  btn.disabled    = true;
+  document.getElementById(`flux-out-${{id}}`).innerHTML = '⏳ Calling Flux…';
+  try {{
+    const r    = await fetch('/generate/image', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ ad_id:id, prompt }}) }});
+    const data = await r.json();
+    const out  = document.getElementById(`flux-out-${{id}}`);
+    if (data.image_url) {{
+      out.innerHTML = `<div><img src="${{data.image_url}}" alt="Generated">${{data.message ? `<div style="padding:6px 8px;font-size:11px;color:#888">${{data.message}}</div>` : ''}}</div>`;
+      const hfBtn = document.getElementById(`hf-btn-${{id}}`);
+      hfBtn.disabled    = false;
+      hfBtn.dataset.imgUrl = data.image_url;
+    }} else {{
+      out.textContent = data.message || 'No image returned';
+    }}
+    btn.textContent = '🖼 Regenerate';
+    btn.disabled    = false;
+  }} catch(e) {{
+    document.getElementById(`flux-out-${{id}}`).textContent = '❌ Error';
+    btn.textContent = '🖼 Generate Image';
+    btn.disabled    = false;
+  }}
+}}
+
+async function generateVideo(id, btn) {{
+  const prompt  = document.getElementById(`hf-prompt-${{id}}`).value;
+  const imgUrl  = btn.dataset.imgUrl || '';
+  btn.textContent = '⏳ Animating…';
+  btn.disabled    = true;
+  document.getElementById(`hf-out-${{id}}`).innerHTML = '⏳ Calling Higgsfield…';
+  try {{
+    const r    = await fetch('/generate/video', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ ad_id:id, prompt, image_url:imgUrl }}) }});
+    const data = await r.json();
+    const out  = document.getElementById(`hf-out-${{id}}`);
+    if (data.video_url) {{
+      out.innerHTML = `<video src="${{data.video_url}}" controls style="width:100%"></video>`;
+    }} else {{
+      out.textContent = data.message || 'No video returned';
+    }}
+    btn.textContent = '🎬 Reanimate';
+    btn.disabled    = false;
+  }} catch(e) {{
+    document.getElementById(`hf-out-${{id}}`).textContent = '❌ Error';
+    btn.textContent = '🎬 Animate';
+    btn.disabled    = false;
+  }}
+}}
+
+function analyzeAll() {{
+  document.querySelectorAll('.gbtn.analyze:not([disabled])').forEach(btn => btn.click());
+}}
+
+async function generateAll() {{
+  const btns = [...document.querySelectorAll('.gbtn.analyze')];
+  for (const btn of btns) {{
+    if (!btn.textContent.includes('✓')) {{ btn.click(); await new Promise(r => setTimeout(r, 500)); }}
+  }}
+  await new Promise(r => setTimeout(r, btns.length * 1500 + 2000));
+  document.querySelectorAll('.gbtn.flux:not([disabled])').forEach(btn => btn.click());
+}}
+
 // ── Download video
 function dlVideo(btn) {{
   const url = btn.dataset.src;
@@ -1241,6 +1617,86 @@ def proxy_vid():
         return resp
     except Exception:
         return "", 502
+
+@app.route("/analyze", methods=["POST"])
+def analyze_ad():
+    """
+    Analyze ad creative and generate prompts for Flux + Higgsfield.
+    PLACEHOLDER — replace with Claude Vision + Gemini calls when API keys are set.
+    Set ANTHROPIC_API_KEY for image analysis, GEMINI_API_KEY for video analysis.
+    """
+    data = request.json or {}
+    adv  = data.get("advertiser", "the brand")
+    fmt  = data.get("format", "IMAGE")
+    title = data.get("title", "")
+    body  = data.get("body", "")
+    imgs  = data.get("orig_imgs", [])
+    vids  = data.get("orig_vids", [])
+
+    print(f"[ANALYZE] {adv} | {fmt} | imgs={len(imgs)} vids={len(vids)}")
+    print(f"[ANALYZE] Title: {title[:80]}")
+    print(f"[ANALYZE] Body:  {body[:200]}")
+
+    is_video = fmt == "VIDEO" or bool(vids)
+
+    flux_prompt = (
+        f"High-quality commercial lifestyle photography, {adv} brand advertisement, "
+        f"authentic UGC aesthetic, natural lighting, photorealistic, 4K, "
+        f"compelling composition, aspirational yet relatable"
+    )
+    hf_prompt = (
+        "Smooth cinematic camera movement, subject speaking directly to camera, "
+        "warm professional lighting, authentic natural feel, slow zoom in, "
+        "shallow depth of field, high production value UGC style"
+    )
+
+    return jsonify({
+        "ad_id":             data.get("ad_id"),
+        "visual_style":      "UGC talking head — single speaker, casual authentic setting",
+        "hook_type":         "Problem-aware hook — opens with pain point before solution",
+        "tone":              "Conversational, trust-building, authoritative",
+        "flux_prompt":       flux_prompt,
+        "higgsfield_prompt": hf_prompt,
+        "note":              "Placeholder analysis — add ANTHROPIC_API_KEY + GEMINI_API_KEY for real vision analysis",
+    })
+
+
+@app.route("/generate/image", methods=["POST"])
+def generate_image():
+    """
+    Generate static image with Flux via fal.ai.
+    PLACEHOLDER — set FAL_API_KEY env var to enable real generation.
+    """
+    data   = request.json or {}
+    prompt = data.get("prompt", "")
+    print(f"[FLUX PLACEHOLDER] {prompt[:120]}")
+    # TODO: fal_client.submit("fal-ai/flux/dev", arguments={"prompt": prompt})
+    return jsonify({
+        "status":    "placeholder",
+        "image_url": "https://placehold.co/800x800/6366f1/white?text=Flux+Image%0AAdd+FAL_API_KEY",
+        "message":   "Placeholder — set FAL_API_KEY in Railway env vars to enable Flux generation",
+    })
+
+
+@app.route("/generate/video", methods=["POST"])
+def generate_video():
+    """
+    Animate image to video with Higgsfield.
+    PLACEHOLDER — set HIGGSFIELD_API_KEY env var to enable real animation.
+    """
+    data      = request.json or {}
+    prompt    = data.get("prompt", "")
+    image_url = data.get("image_url", "")
+    print(f"[HIGGSFIELD PLACEHOLDER] img={image_url[:60]} prompt={prompt[:80]}")
+    # TODO: POST https://platform.higgsfield.ai/higgsfield-ai/dop/standard
+    #       headers: Authorization: Key {HIGGSFIELD_API_KEY}
+    #       body: { image_url, prompt, duration: 5 }
+    return jsonify({
+        "status":    "placeholder",
+        "video_url": None,
+        "message":   "Placeholder — set HIGGSFIELD_API_KEY in Railway env vars to enable Higgsfield animation",
+    })
+
 
 @app.route("/logs")
 @app.route("/logs/<job_id>")
