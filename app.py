@@ -670,7 +670,20 @@ def build_viewer(brand, country, ads):
 
     cards_html = "\n".join(card(a) for a in ads)
     rows_html  = "\n".join(trow(a) for a in ads)
-    brand_slug = brand.replace(" ", "_")
+
+    # Clean label for filenames — pull the meaningful part out of a URL/domain
+    label = brand
+    if "facebook.com/" in label:
+        # Facebook page URL → use the page name (last path segment)
+        seg = label.rstrip("/").split("facebook.com/")[-1].split("/")[0].split("?")[0]
+        label = seg or label
+    elif "://" in label or "." in label and "/" in label:
+        # Full URL → hostname without www.
+        label = (urlparse(label if "://" in label else "https://" + label).netloc or label).replace("www.", "")
+    elif label.count(".") >= 1 and " " not in label:
+        # Bare domain like get-novaburn.com → strip www.
+        label = label.replace("www.", "")
+    brand_slug = label.replace(" ", "_")
 
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>{brand} — Meta Ad Intelligence</title>
@@ -910,6 +923,7 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
 let curFilter = 'all', curView = 'card';
 let selectMode = false;
 const selected = new Set();
+const KEYWORD = "{brand_slug}";  // search term / brand used for this scrape
 
 // Default sort: impressions descending
 sortCards('imp_desc');
@@ -1124,7 +1138,8 @@ async function bulkZip() {{
     const adv    = (card.dataset.advertiser || 'ad').replace(/[^a-z0-9]/gi, '_').slice(0, 30);
     const date   = (card.dataset.date || 'nodate').replace(/[^0-9-]/g, '') || 'nodate';
     const type   = (card.dataset.fmt === 'VIDEO') ? 'VIDEO' : 'STATIC';
-    const folder = zip.folder(`${{idx}}_${{adv}}_${{date}}_${{type}}`);
+    const kw     = (KEYWORD || 'ad').replace(/[^a-z0-9]/gi, '_').slice(0, 30);
+    const folder = zip.folder(`${{date}} - ${{kw}} - ${{type}} - ${{adv}}`);
 
     const imgs = (card.dataset.imgs || '').split(',').filter(Boolean);
     const vids = (card.dataset.vids || '').split(',').filter(Boolean);
