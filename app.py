@@ -1118,7 +1118,9 @@ async function bulkZip() {{
   for (const card of selected) {{
     idx++;
     const adv    = (card.dataset.advertiser || 'ad').replace(/[^a-z0-9]/gi, '_').slice(0, 30);
-    const folder = zip.folder(`${{idx}}_${{adv}}`);
+    const date   = (card.dataset.date || 'nodate').replace(/[^0-9-]/g, '') || 'nodate';
+    const type   = (card.dataset.fmt === 'VIDEO') ? 'VIDEO' : 'STATIC';
+    const folder = zip.folder(`${{idx}}_${{adv}}_${{date}}_${{type}}`);
 
     const imgs = (card.dataset.imgs || '').split(',').filter(Boolean);
     const vids = (card.dataset.vids || '').split(',').filter(Boolean);
