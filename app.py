@@ -13,6 +13,10 @@ app  = Flask(__name__)
 jobs = {}        # { job_id: {status, log, html} }
 last_job_id = None  # track most recent job for /logs endpoint
 
+# In-memory locked cookies — set via /cookies/lock, reused across scrapes until unlocked.
+# Temporary: cleared when the server restarts/redeploys.
+LOCKED_COOKIES = None
+
 # ── Config ───────────────────────────────────────────────────────────────────
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
@@ -1162,7 +1166,6 @@ async function bulkZip() {{
     const lp      = card.dataset.lp      || '';
     const libUrl  = card.dataset.lib     || '';
     const status  = card.dataset.status  || '';
-    const date    = card.dataset.date    || '';
     const fmt     = card.dataset.fmt     || '';
 
     const copyText = [
@@ -1473,8 +1476,16 @@ input:focus,select:focus{border-color:#1877f2;box-shadow:0 0 0 3px rgba(24,119,2
             Install <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" style="color:#1877f2">Cookie-Editor</a> in Chrome → log into Facebook → click the extension → <strong>Export → Export as JSON</strong> → paste below.<br>
             When provided, scraping goes directly to Meta's API (no Apify cost) and can see all ad creatives.
           </p>
-          <textarea name="cookies" placeholder='[{"name":"datr","value":"..."},{"name":"c_user","value":"..."},...]'
+          <textarea name="cookies" id="cookies-box" placeholder='[{"name":"datr","value":"..."},{"name":"c_user","value":"..."},...]'
             style="width:100%;height:72px;padding:8px 10px;border:1px solid #ddd;border-radius:7px;font-size:11px;font-family:monospace;resize:vertical;outline:none;color:#444"></textarea>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+            <button type="button" id="lock-btn" onclick="lockCookies()"
+              style="background:#f0f2f5;border:1px solid #ddd;border-radius:7px;padding:6px 14px;cursor:pointer;font-size:12px;font-weight:bold;color:#333">🔒 Lock cookies</button>
+            <span id="cookie-status" style="font-size:11px;color:#888"></span>
+          </div>
+          <p style="font-size:10px;color:#aaa;margin-top:6px;line-height:1.4">
+            Locking saves your cookies on the server so you don't re-paste them each scrape. Cleared on redeploy.
+          </p>
         </div>
       </details>
     </div>
@@ -1494,6 +1505,44 @@ function addRow() {
 function removeRow(b) {
   if (document.querySelectorAll('.search-row').length > 1) b.parentElement.remove();
 }
+
+// ── Cookie lock/unlock
+function renderCookieStatus(locked, count) {
+  const status = document.getElementById('cookie-status');
+  const btn    = document.getElementById('lock-btn');
+  const box    = document.getElementById('cookies-box');
+  if (locked) {
+    status.innerHTML = '🟢 <strong>' + count + ' cookies locked</strong> — reused every scrape';
+    btn.textContent  = '🔓 Unlock';
+    btn.onclick      = unlockCookies;
+    box.placeholder  = 'Cookies locked — leave blank to reuse, or paste new ones to replace.';
+  } else {
+    status.textContent = '⚪ Not locked';
+    btn.textContent    = '🔒 Lock cookies';
+    btn.onclick        = lockCookies;
+  }
+}
+async function lockCookies() {
+  const raw = document.getElementById('cookies-box').value.trim();
+  if (!raw) { alert('Paste your cookies JSON first, then click Lock.'); return; }
+  const btn = document.getElementById('lock-btn');
+  btn.textContent = '⏳ Locking…';
+  try {
+    const r = await fetch('/cookies/lock', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ cookies: raw })
+    });
+    const d = await r.json();
+    if (d.ok) { document.getElementById('cookies-box').value = ''; renderCookieStatus(true, d.count); }
+    else      { alert('Lock failed: ' + (d.error || 'unknown')); renderCookieStatus(false, 0); }
+  } catch(e) { alert('Lock failed: ' + e); renderCookieStatus(false, 0); }
+}
+async function unlockCookies() {
+  await fetch('/cookies/unlock', { method: 'POST' });
+  renderCookieStatus(false, 0);
+}
+// Check lock state on page load
+fetch('/cookies/status').then(r => r.json()).then(d => renderCookieStatus(d.locked, d.count)).catch(() => {});
 </script>
 </body></html>"""
 
@@ -1573,7 +1622,8 @@ def start():
     if not searches:
         searches = [[]]
 
-    # Parse optional Facebook session cookies (Cookie-Editor JSON export)
+    # Parse optional Facebook session cookies (Cookie-Editor JSON export).
+    # If the textarea is empty, fall back to locked cookies (if any).
     cookies = None
     cookies_raw = request.form.get("cookies", "").strip()
     if cookies_raw:
@@ -1583,6 +1633,8 @@ def start():
                 cookies = None
         except Exception:
             cookies = None
+    if cookies is None and LOCKED_COOKIES:
+        cookies = LOCKED_COOKIES
 
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "running", "log": [], "html": None}
@@ -1602,6 +1654,35 @@ def start():
 def status(job_id):
     job = jobs.get(job_id, {})
     return jsonify({"status": job.get("status", "unknown"), "log": job.get("log", [])})
+
+@app.route("/cookies/status")
+def cookies_status():
+    """Report whether cookies are currently locked."""
+    n = len(LOCKED_COOKIES) if LOCKED_COOKIES else 0
+    return jsonify({"locked": bool(LOCKED_COOKIES), "count": n})
+
+@app.route("/cookies/lock", methods=["POST"])
+def cookies_lock():
+    """Save cookies in memory so they're reused on every scrape."""
+    global LOCKED_COOKIES
+    raw = (request.json or {}).get("cookies", "").strip()
+    if not raw:
+        return jsonify({"ok": False, "error": "No cookies provided"}), 400
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or not parsed:
+            return jsonify({"ok": False, "error": "Cookies must be a non-empty JSON array"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Invalid JSON: {e}"}), 400
+    LOCKED_COOKIES = parsed
+    return jsonify({"ok": True, "count": len(parsed)})
+
+@app.route("/cookies/unlock", methods=["POST"])
+def cookies_unlock():
+    """Clear locked cookies."""
+    global LOCKED_COOKIES
+    LOCKED_COOKIES = None
+    return jsonify({"ok": True})
 
 @app.route("/img")
 def proxy_img():
