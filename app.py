@@ -4,7 +4,7 @@ Uses curious_coder/facebook-ads-library-scraper (actor: XtaWFhbtfxyzqrFmd)
 Deploy on Railway — set APIFY_TOKEN env var.
 """
 
-import json, time, threading, uuid, urllib.request, os, re
+import json, time, threading, uuid, urllib.request, os, re, io, wave, base64
 from urllib.parse import urlparse, quote as urlquote, parse_qs
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
@@ -1499,6 +1499,14 @@ async function falImage(prompt) {{
   return {{ url: d.image_url || null, message: d.message || '' }};
 }}
 
+async function genVoice(text) {{
+  try {{
+    const r = await fetch('/generate/voice', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ text }}) }});
+    const d = await r.json();
+    return d.audio_url || null;
+  }} catch(e) {{ return null; }}
+}}
+
 function higgsAnimate(prompt, imageUrl) {{
   return new Promise(async (resolve) => {{
     try {{
@@ -1565,6 +1573,7 @@ async function generateFullAd(id, btn) {{
           <div class="gen-out-box"><div class="gen-out-label">🖼 Still</div><div class="gen-out-content" id="beat-img-${{id}}-${{i}}">⏳ queued</div></div>
           <div class="gen-out-box"><div class="gen-out-label">🎬 Clip</div><div class="gen-out-content" id="beat-vid-${{id}}-${{i}}">⏳ waiting for still</div></div>
         </div>
+        <div class="gen-out-box" style="margin-top:8px"><div class="gen-out-label">🔊 Voiceover</div><div class="gen-out-content" id="beat-vox-${{id}}-${{i}}" style="min-height:0;padding:8px">⏳ waiting</div></div>
       </div>`;
     box.appendChild(card);
   }});
@@ -1584,8 +1593,19 @@ async function generateFullAd(id, btn) {{
 
     vidCell.textContent = '🎬 animating…';
     const vidUrl = await higgsAnimate(b.higgsfield_prompt, imgUrl);
-    if (!vidUrl) {{ vidCell.textContent = '❌ clip failed'; continue; }}
-    vidCell.innerHTML = `<video src="${{vidUrl}}" controls style="width:100%"></video>`;
+    if (!vidUrl) {{ vidCell.textContent = '❌ clip failed'; }}
+    else {{ vidCell.innerHTML = `<video src="${{vidUrl}}" controls style="width:100%"></video>`; }}
+
+    // Voiceover from the beat's script line (one consistent voice)
+    const voxCell = document.getElementById(`beat-vox-${{id}}-${{i}}`);
+    if (b.script_line) {{
+      voxCell.textContent = '🔊 generating voice…';
+      const vox = await genVoice(b.script_line);
+      if (vox) voxCell.innerHTML = `<audio controls src="${{vox}}" style="width:100%"></audio>`;
+      else     voxCell.textContent = '❌ voice failed';
+    }} else {{
+      voxCell.textContent = '— no line';
+    }}
   }}
 
   btn.textContent = '✓ Full Ad Generated';
@@ -2480,6 +2500,74 @@ def generate_video_status():
         return jsonify({"status": "error", "message": f"HTTP {e.code}: {err}"}), 502
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 502
+
+
+# Gemini TTS — voice + model overridable via env vars
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_VOICE     = os.environ.get("GEMINI_VOICE", "Kore")  # one consistent voice per SOP
+
+@app.route("/generate/voice", methods=["POST"])
+def generate_voice():
+    """Text-to-speech via Gemini. Returns a playable WAV as a base64 data URL."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": "GEMINI_API_KEY not set"}), 400
+    data  = request.json or {}
+    text  = (data.get("text") or "").strip()
+    voice = (data.get("voice") or GEMINI_VOICE).strip()
+    if not text:
+        return jsonify({"error": "empty text"}), 400
+    try:
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                },
+            },
+        }).encode()
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/models/{GEMINI_TTS_MODEL}:generateContent?key={api_key}",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        resp = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    resp = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as he:
+                if he.code in (429, 503) and attempt < 3:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise
+        part = resp["candidates"][0]["content"]["parts"][0]
+        inline = part.get("inlineData") or part.get("inline_data") or {}
+        b64pcm = inline.get("data")
+        mime   = inline.get("mimeType") or inline.get("mime_type") or ""
+        if not b64pcm:
+            return jsonify({"error": "no audio returned"}), 502
+        rate = 24000
+        m = re.search(r"rate=(\d+)", mime)
+        if m:
+            rate = int(m.group(1))
+        pcm = base64.b64decode(b64pcm)
+        # Wrap raw PCM (16-bit mono) in a WAV container so browsers can play it
+        buf = io.BytesIO()
+        w = wave.open(buf, "wb")
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+        w.writeframes(pcm); w.close()
+        wav_b64 = base64.b64encode(buf.getvalue()).decode()
+        return jsonify({"audio_url": f"data:audio/wav;base64,{wav_b64}"})
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:250]
+        except Exception: err = ""
+        print(f"[TTS] HTTP {e.code}: {err}")
+        return jsonify({"error": f"HTTP {e.code}: {err}"}), 502
+    except Exception as e:
+        print(f"[TTS] error: {e}")
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/logs")
