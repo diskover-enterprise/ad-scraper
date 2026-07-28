@@ -76,8 +76,13 @@ def apify_req(method, path, payload=None):
     data = json.dumps(payload).encode() if payload else None
     hdrs = {"Content-Type": "application/json"} if data else {}
     req  = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:    body_err = e.read().decode()[:300]
+        except Exception: body_err = ""
+        raise Exception(f"Apify {method} {path} → HTTP {e.code}: {body_err}")
 
 def api_post(path, payload):
     return apify_req("POST", path, payload)
@@ -1817,7 +1822,7 @@ def proxy_vid():
 
 # ── Gemini creative analysis ──────────────────────────────────────────────
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta"
 
 def _fetch_media(url):
@@ -1933,8 +1938,18 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
             f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent?key={api_key}",
             data=payload, headers={"Content-Type": "application/json"}, method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as r:
-            resp = json.loads(r.read())
+        # Retry on 429 (rate limit) / 503 (overloaded) with backoff
+        resp = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    resp = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as he:
+                if he.code in (429, 503) and attempt < 3:
+                    time.sleep(5 * (attempt + 1))  # 5s, 10s, 15s
+                    continue
+                raise
         text = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
         # Strip code fences if present
         text = re.sub(r"^```(?:json)?|```$", "", text.strip()).strip()
