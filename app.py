@@ -2307,7 +2307,7 @@ def generate_image():
     """Generate a 9:16 still with Flux via fal.ai (synchronous)."""
     data   = request.json or {}
     prompt = data.get("prompt", "")
-    fal_key = os.environ.get("FAL_API_KEY", "")
+    fal_key = os.environ.get("FAL_API_KEY", "").strip()
 
     if not fal_key:
         return jsonify({
@@ -2355,8 +2355,8 @@ def generate_image():
 HIGGSFIELD_MODEL = os.environ.get("HIGGSFIELD_MODEL", "higgsfield-ai/dop/standard")
 
 def _higgsfield_auth():
-    key    = os.environ.get("HIGGSFIELD_API_KEY", "")
-    secret = os.environ.get("HIGGSFIELD_API_SECRET", "")
+    key    = os.environ.get("HIGGSFIELD_API_KEY", "").strip()
+    secret = os.environ.get("HIGGSFIELD_API_SECRET", "").strip()
     if not key or not secret:
         return None
     return f"Key {key}:{secret}"
