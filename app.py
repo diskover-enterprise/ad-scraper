@@ -321,8 +321,21 @@ def translate_text(title, body):
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            resp = json.loads(r.read())
+
+        # Retry on transient overload/rate-limit (529 / 429) with backoff
+        resp = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    resp = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as he:
+                if he.code in (429, 529) and attempt < 3:
+                    time.sleep(2 * (attempt + 1))  # 2s, 4s, 6s
+                    continue
+                raise
+        if resp is None:
+            raise Exception("no response after retries")
 
         reply = resp["content"][0]["text"].strip()
         if reply.upper().startswith("ENGLISH"):
@@ -860,6 +873,15 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   <button class="fbtn" id="gbtn" onclick="toggleGroup(this)">⊞ Group</button>
   <button class="fbtn" id="selbtn" onclick="toggleSelectMode(this)">☐ Select</button>
   <input id="srch" class="search-box" placeholder="Search advertiser or copy…" oninput="applyFilters()">
+  <select class="sort-sel" id="period-sel" onchange="setPeriod(this.value)">
+    <option value="all">📅 All dates</option>
+    <option value="w0">This week</option>
+    <option value="w1">Last week</option>
+    <option value="d7">Last 7 days</option>
+    <option value="d30">Last 30 days</option>
+    <option value="m0">This month</option>
+    <option value="m1">Last month</option>
+  </select>
   <select class="sort-sel" onchange="sortCards(this.value)">
     <option value="">Sort: default</option>
     <option value="imp_desc" selected>Impressions ↓</option>
@@ -921,9 +943,41 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
 <script>
 // ── State
 let curFilter = 'all', curView = 'card';
+let curPeriod = 'all';
 let selectMode = false;
 const selected = new Set();
 const KEYWORD = "{brand_slug}";  // search term / brand used for this scrape
+
+// ── Period (date) filter
+function setPeriod(p) {{ curPeriod = p; applyFilters(); }}
+
+function matchPeriod(el) {{
+  if (curPeriod === 'all') return true;
+  const ds = el.dataset.date || '';
+  const d  = new Date(ds);
+  if (isNaN(d)) return false;  // no valid date → hide when filtering by period
+  const now = new Date();
+  const day = 86400000;
+
+  // Start of current week (Monday)
+  const startOfWeek = (ref) => {{
+    const x = new Date(ref);
+    const wd = (x.getDay() + 6) % 7;  // Mon=0
+    x.setHours(0,0,0,0); x.setDate(x.getDate() - wd);
+    return x;
+  }};
+
+  if (curPeriod === 'd7')  return (now - d) <= 7  * day;
+  if (curPeriod === 'd30') return (now - d) <= 30 * day;
+  if (curPeriod === 'w0') {{ const s = startOfWeek(now); return d >= s; }}
+  if (curPeriod === 'w1') {{ const s = startOfWeek(now); const p = new Date(s - 7*day); return d >= p && d < s; }}
+  if (curPeriod === 'm0') return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+  if (curPeriod === 'm1') {{
+    const m = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    return d.getFullYear() === m.getFullYear() && d.getMonth() === m.getMonth();
+  }}
+  return true;
+}}
 
 // Default sort: impressions descending
 sortCards('imp_desc');
@@ -944,13 +998,13 @@ function applyFilters() {{
   let n = 0;
   if (curView === 'card') {{
     document.querySelectorAll('.card').forEach(c => {{
-      const show = matchF(c) && (!q || [c.dataset.advertiser, c.dataset.body, c.dataset.title].some(s => (s||'').toLowerCase().includes(q)));
+      const show = matchF(c) && matchPeriod(c) && (!q || [c.dataset.advertiser, c.dataset.body, c.dataset.title].some(s => (s||'').toLowerCase().includes(q)));
       c.style.display = show ? '' : 'none';
       if (show) n++;
     }});
   }} else {{
     document.querySelectorAll('#tbody tr').forEach(r => {{
-      const show = matchF(r) && (!q || r.textContent.toLowerCase().includes(q));
+      const show = matchF(r) && matchPeriod(r) && (!q || r.textContent.toLowerCase().includes(q));
       r.style.display = show ? '' : 'none';
       if (show) n++;
     }});
