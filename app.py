@@ -1796,46 +1796,191 @@ def proxy_vid():
     except Exception:
         return "", 502
 
+# ── Gemini creative analysis ──────────────────────────────────────────────
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta"
+
+def _fetch_media(url):
+    """Download an image/video from Facebook CDN. Returns (bytes, content_type) or (None, None)."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer":    "https://www.facebook.com/",
+        })
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read(), r.headers.get("Content-Type", "")
+    except Exception as e:
+        print(f"[GEMINI] media fetch failed: {e}")
+        return None, None
+
+def _gemini_upload_file(data_bytes, mime, api_key):
+    """Upload a media file to Gemini File API (needed for video). Returns file_uri or None."""
+    try:
+        # Start resumable upload
+        start = urllib.request.Request(
+            f"{GEMINI_BASE.replace('/v1beta','')}/upload/v1beta/files?key={api_key}",
+            data=json.dumps({"file": {"display_name": "ad_media"}}).encode(),
+            headers={
+                "X-Goog-Upload-Protocol":       "resumable",
+                "X-Goog-Upload-Command":        "start",
+                "X-Goog-Upload-Header-Content-Length": str(len(data_bytes)),
+                "X-Goog-Upload-Header-Content-Type":   mime,
+                "Content-Type":                 "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(start, timeout=30) as r:
+            upload_url = r.headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            return None
+        # Upload the bytes and finalize
+        up = urllib.request.Request(
+            upload_url, data=data_bytes,
+            headers={
+                "Content-Length":        str(len(data_bytes)),
+                "X-Goog-Upload-Offset":  "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(up, timeout=120) as r:
+            info = json.loads(r.read())
+        file_uri  = info["file"]["uri"]
+        file_name = info["file"]["name"]
+        # Poll until the file finishes processing (videos need this)
+        for _ in range(20):
+            chk = urllib.request.Request(f"{GEMINI_BASE}/{file_name}?key={api_key}")
+            with urllib.request.urlopen(chk, timeout=30) as r:
+                st = json.loads(r.read())
+            if st.get("state") == "ACTIVE":
+                return file_uri
+            if st.get("state") == "FAILED":
+                return None
+            time.sleep(3)
+        return file_uri
+    except Exception as e:
+        print(f"[GEMINI] upload failed: {e}")
+        return None
+
+def gemini_analyze(adv, title, body, img_urls, vid_urls):
+    """Analyze the ad creative (video or image) with Gemini. Returns dict or None."""
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return None
+
+    parts = []
+    media_kind = None
+
+    # Prefer the video if present, else the first image
+    if vid_urls:
+        raw, ct = _fetch_media(vid_urls[0])
+        if raw:
+            mime = ct if ct.startswith("video/") else "video/mp4"
+            file_uri = _gemini_upload_file(raw, mime, api_key)
+            if file_uri:
+                parts.append({"file_data": {"mime_type": mime, "file_uri": file_uri}})
+                media_kind = "video"
+    if media_kind is None and img_urls:
+        raw, ct = _fetch_media(img_urls[0])
+        if raw:
+            mime = ct if ct.startswith("image/") else "image/jpeg"
+            b64  = __import__("base64").b64encode(raw).decode()
+            parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+            media_kind = "image"
+
+    instruction = (
+        f"You are a direct-response ad strategist studying a competitor's {media_kind or 'creative'} ad "
+        f"for the brand \"{adv}\".\n\n"
+        f"Ad headline: {title}\nAd copy: {body}\n\n"
+        "Study the creative carefully and respond ONLY with valid JSON in this exact shape:\n"
+        "{\n"
+        '  "visual_style": "one concise sentence describing the visual format/style",\n'
+        '  "hook_type": "one concise sentence describing the opening hook/angle",\n'
+        '  "tone": "a few words describing tone",\n'
+        '  "flux_prompt": "a detailed image-generation prompt to recreate a fresh iteration of this creative style (no brand names, no on-image text instructions unless key)",\n'
+        '  "higgsfield_prompt": "a detailed motion/animation prompt describing camera movement and action to animate the generated image into a video ad"\n'
+        "}\n"
+        "This is for competitive research only. Do not copy exact wording, medical claims, or the creative verbatim — describe the style so a NEW original ad can be made."
+    )
+    parts.append({"text": instruction})
+
+    try:
+        payload = json.dumps({
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.4, "response_mime_type": "application/json"},
+        }).encode()
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent?key={api_key}",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            resp = json.loads(r.read())
+        text = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip code fences if present
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip()).strip()
+        parsed = json.loads(text)
+        parsed["media_kind"] = media_kind
+        return parsed
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:200]
+        except Exception: err = ""
+        print(f"[GEMINI] HTTP {e.code}: {err}")
+        return {"error": f"HTTP {e.code}: {err}"}
+    except Exception as e:
+        print(f"[GEMINI] error: {e}")
+        return {"error": str(e)}
+
+
 @app.route("/analyze", methods=["POST"])
 def analyze_ad():
-    """
-    Analyze ad creative and generate prompts for Flux + Higgsfield.
-    PLACEHOLDER — replace with Claude Vision + Gemini calls when API keys are set.
-    Set ANTHROPIC_API_KEY for image analysis, GEMINI_API_KEY for video analysis.
-    """
-    data = request.json or {}
-    adv  = data.get("advertiser", "the brand")
-    fmt  = data.get("format", "IMAGE")
+    """Analyze ad creative with Gemini and generate Flux + Higgsfield prompts."""
+    data  = request.json or {}
+    adv   = data.get("advertiser", "the brand")
+    fmt   = data.get("format", "IMAGE")
     title = data.get("title", "")
     body  = data.get("body", "")
     imgs  = data.get("orig_imgs", [])
     vids  = data.get("orig_vids", [])
 
     print(f"[ANALYZE] {adv} | {fmt} | imgs={len(imgs)} vids={len(vids)}")
-    print(f"[ANALYZE] Title: {title[:80]}")
-    print(f"[ANALYZE] Body:  {body[:200]}")
 
-    is_video = fmt == "VIDEO" or bool(vids)
+    # No key → fall back to a generic (placeholder) analysis
+    if not os.environ.get("GEMINI_API_KEY"):
+        return jsonify({
+            "ad_id":             data.get("ad_id"),
+            "visual_style":      "UGC talking head — single speaker, casual authentic setting",
+            "hook_type":         "Problem-aware hook — opens with pain point before solution",
+            "tone":              "Conversational, trust-building, authoritative",
+            "flux_prompt":       f"High-quality commercial lifestyle photography, authentic UGC aesthetic, natural lighting, photorealistic, 4K",
+            "higgsfield_prompt": "Smooth cinematic camera movement, subject speaking to camera, warm lighting, slow zoom in, shallow depth of field",
+            "note":              "Placeholder — set GEMINI_API_KEY for real creative analysis",
+        })
 
-    flux_prompt = (
-        f"High-quality commercial lifestyle photography, {adv} brand advertisement, "
-        f"authentic UGC aesthetic, natural lighting, photorealistic, 4K, "
-        f"compelling composition, aspirational yet relatable"
-    )
-    hf_prompt = (
-        "Smooth cinematic camera movement, subject speaking directly to camera, "
-        "warm professional lighting, authentic natural feel, slow zoom in, "
-        "shallow depth of field, high production value UGC style"
-    )
+    result = gemini_analyze(adv, title, body, imgs, vids)
+    if result and result.get("error"):
+        return jsonify({
+            "ad_id": data.get("ad_id"),
+            "visual_style": "—", "hook_type": "—", "tone": "—",
+            "flux_prompt": "", "higgsfield_prompt": "",
+            "note": f"⚠️ Gemini error: {result['error']}",
+        })
+    if not result:
+        return jsonify({
+            "ad_id": data.get("ad_id"),
+            "visual_style": "—", "hook_type": "—", "tone": "—",
+            "flux_prompt": "", "higgsfield_prompt": "",
+            "note": "⚠️ Could not fetch creative media to analyze",
+        })
 
     return jsonify({
         "ad_id":             data.get("ad_id"),
-        "visual_style":      "UGC talking head — single speaker, casual authentic setting",
-        "hook_type":         "Problem-aware hook — opens with pain point before solution",
-        "tone":              "Conversational, trust-building, authoritative",
-        "flux_prompt":       flux_prompt,
-        "higgsfield_prompt": hf_prompt,
-        "note":              "Placeholder analysis — add ANTHROPIC_API_KEY + GEMINI_API_KEY for real vision analysis",
+        "visual_style":      result.get("visual_style", ""),
+        "hook_type":         result.get("hook_type", ""),
+        "tone":              result.get("tone", ""),
+        "flux_prompt":       result.get("flux_prompt", ""),
+        "higgsfield_prompt": result.get("higgsfield_prompt", ""),
+        "note":              f"Analyzed {result.get('media_kind','creative')} with Gemini",
     })
 
 
