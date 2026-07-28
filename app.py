@@ -1477,7 +1477,7 @@ async function generateVideo(id, btn) {{
           btn.textContent = '🎬 Animate'; btn.disabled = false;
           return;
         }}
-        if (tries > 60) {{ out.textContent = '⚠️ Timed out — try again'; btn.textContent = '🎬 Animate'; btn.disabled = false; return; }}
+        if (tries > 144) {{ out.textContent = '⚠️ Timed out — try again'; btn.textContent = '🎬 Animate'; btn.disabled = false; return; }}
         setTimeout(poll, 5000);  // poll every 5s, up to ~5 min
       }} catch(e) {{
         if (tries > 60) {{ out.textContent = '❌ Polling error'; btn.textContent = '🎬 Animate'; btn.disabled = false; return; }}
@@ -1496,7 +1496,7 @@ async function generateVideo(id, btn) {{
 async function falImage(prompt) {{
   const r = await fetch('/generate/image', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ prompt }}) }});
   const d = await r.json();
-  return d.image_url || null;
+  return {{ url: d.image_url || null, message: d.message || '' }};
 }}
 
 function higgsAnimate(prompt, imageUrl) {{
@@ -1513,7 +1513,7 @@ function higgsAnimate(prompt, imageUrl) {{
           const sd = await sr.json();
           if (sd.status === 'completed' && sd.video_url) return resolve(sd.video_url);
           if (['failed','nsfw','error'].includes(sd.status)) return resolve(null);
-          if (tries > 60) return resolve(null);
+          if (tries > 144) return resolve(null);
           setTimeout(poll, 5000);
         }} catch(e) {{ if (tries > 60) return resolve(null); setTimeout(poll, 5000); }}
       }};
@@ -1577,8 +1577,9 @@ async function generateFullAd(id, btn) {{
     const vidCell = document.getElementById(`beat-vid-${{id}}-${{i}}`);
 
     imgCell.textContent = '⏳ generating still…';
-    const imgUrl = await falImage(b.flux_prompt);
-    if (!imgUrl) {{ imgCell.textContent = '❌ still failed'; vidCell.textContent = '— skipped'; continue; }}
+    const imgRes = await falImage(b.flux_prompt);
+    if (!imgRes.url) {{ imgCell.innerHTML = `<span style="color:#c00;font-size:11px">❌ ${{imgRes.message || 'still failed'}}</span>`; vidCell.textContent = '— skipped'; continue; }}
+    const imgUrl = imgRes.url;
     imgCell.innerHTML = `<img src="${{imgUrl}}" style="width:100%">`;
 
     vidCell.textContent = '🎬 animating…';
@@ -2441,8 +2442,18 @@ def generate_video_status():
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
         status    = resp.get("status", "")
-        video_url = (resp.get("video") or {}).get("url") if isinstance(resp.get("video"), dict) else None
-        return jsonify({"status": status, "video_url": video_url})
+        # Video URL can be nested a few ways depending on model — check them all
+        video_url = None
+        v = resp.get("video")
+        if isinstance(v, dict):
+            video_url = v.get("url")
+        if not video_url and isinstance(resp.get("videos"), list) and resp["videos"]:
+            first = resp["videos"][0]
+            video_url = first.get("url") if isinstance(first, dict) else first
+        if not video_url and isinstance(resp.get("output"), dict):
+            video_url = resp["output"].get("url") or resp["output"].get("video_url")
+        print(f"[HIGGSFIELD status] {rid[:8]} → status={status} url={'yes' if video_url else 'no'}")
+        return jsonify({"status": status, "video_url": video_url, "raw": resp})
     except urllib.error.HTTPError as e:
         try:    err = e.read().decode()[:250]
         except Exception: err = ""
