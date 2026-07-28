@@ -2397,7 +2397,12 @@ def generate_video():
         req = urllib.request.Request(
             f"https://platform.higgsfield.ai/{HIGGSFIELD_MODEL}",
             data=payload,
-            headers={"Authorization": auth, "Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Authorization": auth,
+                "Content-Type":  "application/json",
+                "Accept":        "application/json",
+                "User-Agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -2426,7 +2431,11 @@ def generate_video_status():
     try:
         req = urllib.request.Request(
             f"https://platform.higgsfield.ai/requests/{rid}/status",
-            headers={"Authorization": auth, "Accept": "application/json"},
+            headers={
+                "Authorization": auth,
+                "Accept":        "application/json",
+                "User-Agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=30) as r:
