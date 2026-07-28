@@ -13,9 +13,27 @@ app  = Flask(__name__)
 jobs = {}        # { job_id: {status, log, html} }
 last_job_id = None  # track most recent job for /logs endpoint
 
-# In-memory locked cookies — set via /cookies/lock, reused across scrapes until unlocked.
-# Temporary: cleared when the server restarts/redeploys.
-LOCKED_COOKIES = None
+# Locked cookies — stored in a file so every gunicorn worker can read them.
+# Set via /cookies/lock, reused across scrapes until unlocked. Cleared on redeploy.
+COOKIE_STORE = "/tmp/locked_cookies.json"
+
+def get_locked_cookies():
+    try:
+        with open(COOKIE_STORE) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) and data else None
+    except Exception:
+        return None
+
+def set_locked_cookies(cookies):
+    with open(COOKIE_STORE, "w") as f:
+        json.dump(cookies, f)
+
+def clear_locked_cookies():
+    try:
+        os.remove(COOKIE_STORE)
+    except Exception:
+        pass
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -1702,8 +1720,10 @@ def start():
                 cookies = None
         except Exception:
             cookies = None
-    if cookies is None and LOCKED_COOKIES:
-        cookies = LOCKED_COOKIES
+    if cookies is None:
+        locked = get_locked_cookies()
+        if locked:
+            cookies = locked
 
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "running", "log": [], "html": None}
@@ -1727,13 +1747,13 @@ def status(job_id):
 @app.route("/cookies/status")
 def cookies_status():
     """Report whether cookies are currently locked."""
-    n = len(LOCKED_COOKIES) if LOCKED_COOKIES else 0
-    return jsonify({"locked": bool(LOCKED_COOKIES), "count": n})
+    locked = get_locked_cookies()
+    n = len(locked) if locked else 0
+    return jsonify({"locked": bool(locked), "count": n})
 
 @app.route("/cookies/lock", methods=["POST"])
 def cookies_lock():
-    """Save cookies in memory so they're reused on every scrape."""
-    global LOCKED_COOKIES
+    """Save cookies to disk so they're reused on every scrape (survives across workers)."""
     raw = (request.json or {}).get("cookies", "").strip()
     if not raw:
         return jsonify({"ok": False, "error": "No cookies provided"}), 400
@@ -1743,14 +1763,13 @@ def cookies_lock():
             return jsonify({"ok": False, "error": "Cookies must be a non-empty JSON array"}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": f"Invalid JSON: {e}"}), 400
-    LOCKED_COOKIES = parsed
+    set_locked_cookies(parsed)
     return jsonify({"ok": True, "count": len(parsed)})
 
 @app.route("/cookies/unlock", methods=["POST"])
 def cookies_unlock():
     """Clear locked cookies."""
-    global LOCKED_COOKIES
-    LOCKED_COOKIES = None
+    clear_locked_cookies()
     return jsonify({"ok": True})
 
 @app.route("/img")
