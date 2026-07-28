@@ -1957,6 +1957,22 @@ def proxy_vid():
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta"
 
+# Keeps generated prompts clear of AI content-moderation filters (Higgsfield/fal)
+# while preserving the persuasive hook energy. The suggestive punch lives in the
+# COPY and landing page, not the generated visual.
+FILTER_SAFE_RULES = (
+    "\n==== FILTER-SAFE VISUAL RULES (critical for AI generation) ====\n"
+    "The image/video generators reject sexual, explicit, or overtly suggestive content. "
+    "Keep every flux_prompt and higgsfield_prompt strictly WHOLESOME and BRAND-SAFE:\n"
+    "- Frame benefits as vitality, energy, confidence, wellness, healthy lifestyle — never sexual acts, arousal, or explicit anatomy.\n"
+    "- Wardrobe: everyday casual/modest clothing. No lingerie, nudity, swimwear, or revealing/suggestive poses.\n"
+    "- Setting: normal home/kitchen/gym/outdoor lifestyle. Subject simply speaking to camera, smiling, holding the product.\n"
+    "- No sexual innuendo in the VISUAL description. The persuasion/edge belongs in the ad COPY and landing page, not the rendered footage.\n"
+    "- If the source ad is sexual in nature, translate the ENERGY (confidence, relief, excitement) into a clean, everyday testimonial visual.\n"
+    "This is how compliant advertisers pass generation filters: tame visual, punchy copy.\n"
+    "==============================================================\n\n"
+)
+
 def _fetch_media(url):
     """Download an image/video from Facebook CDN. Returns (bytes, content_type) or (None, None)."""
     try:
@@ -2093,6 +2109,7 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
         '  "flux_prompt": "A single richly detailed text-to-image prompt (80-120 words) for a FRESH original still matching this creative style, built strictly from the 7 house elements above IN ORDER (Subject, Materials/Textures, Composition/Framing with named lens + f-stop, Lighting with direction + color temp, Style, Background, then end with the 9:16 format + quality tag). Include at least one deliberate imperfection/analog descriptor. No brand names, logos, or on-image text.",\n'
         '  "higgsfield_prompt": "A still-to-video motion prompt (50-80 words) following the house motion-layer rules: what moves, what stays still, camera behavior, motion duration/quality, and atmosphere — believable front-camera UGC phone footage with natural blinking."\n'
         "}\n\n"
+        + FILTER_SAFE_RULES +
         "COMPETITIVE RESEARCH ONLY: describe the STYLE so a NEW, original ad can be produced. "
         "Do NOT reproduce exact wording, medical/health claims, logos, or the creative verbatim."
     )
@@ -2193,6 +2210,7 @@ def gemini_analyze_beats(adv, title, body, img_urls, vid_urls):
         '    {"beat": "RESULT_CTA", ...}\n'
         "  ]\n"
         "}\n\n"
+        + FILTER_SAFE_RULES +
         "COMPETITIVE RESEARCH ONLY: original script and visuals in the same winning STYLE. "
         "Do NOT copy exact wording, medical/health claims, logos, or the creative verbatim."
     )
@@ -2453,6 +2471,8 @@ def generate_video_status():
         if not video_url and isinstance(resp.get("output"), dict):
             video_url = resp["output"].get("url") or resp["output"].get("video_url")
         print(f"[HIGGSFIELD status] {rid[:8]} → status={status} url={'yes' if video_url else 'no'}")
+        if status in ("failed", "nsfw"):
+            print(f"[HIGGSFIELD FAIL] {rid[:8]} raw={json.dumps(resp)[:500]}")
         return jsonify({"status": status, "video_url": video_url, "raw": resp})
     except urllib.error.HTTPError as e:
         try:    err = e.read().decode()[:250]
