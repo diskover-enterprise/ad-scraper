@@ -1392,10 +1392,11 @@ async function analyzeAd(id, btn) {{
     const r    = await fetch('/analyze', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload) }});
     const data = await r.json();
     const el   = document.getElementById(`analysis-${{id}}`);
-    el.innerHTML = `<strong>Visual Style:</strong> ${{data.visual_style}}<br>
+    el.innerHTML = `${{data.scene_breakdown ? `<strong>🎬 What Gemini saw:</strong> ${{data.scene_breakdown}}<br><br>` : ''}}
+                    <strong>Visual Style:</strong> ${{data.visual_style}}<br>
                     <strong>Hook Type:</strong> ${{data.hook_type}}<br>
                     <strong>Tone:</strong> ${{data.tone}}
-                    ${{data.note ? `<br><em style="color:#888;font-size:11px">⚠️ ${{data.note}}</em>` : ''}}`;
+                    ${{data.note ? `<br><em style="color:#888;font-size:11px">${{data.note}}</em>` : ''}}`;
     el.style.display = 'block';
     document.getElementById(`flux-prompt-${{id}}`).value = data.flux_prompt;
     document.getElementById(`hf-prompt-${{id}}`).value   = data.higgsfield_prompt;
@@ -1822,7 +1823,7 @@ def proxy_vid():
 
 # ── Gemini creative analysis ──────────────────────────────────────────────
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta"
 
 def _fetch_media(url):
@@ -1913,19 +1914,51 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
             parts.append({"inline_data": {"mime_type": mime, "data": b64}})
             media_kind = "image"
 
+    is_video = media_kind == "video"
     instruction = (
-        f"You are a direct-response ad strategist studying a competitor's {media_kind or 'creative'} ad "
-        f"for the brand \"{adv}\".\n\n"
+        f"You are an elite direct-response creative strategist and prompt engineer for "
+        f"Big Wave Media, studying a competitor's {media_kind or 'creative'} ad for the brand \"{adv}\".\n\n"
         f"Ad headline: {title}\nAd copy: {body}\n\n"
-        "Study the creative carefully and respond ONLY with valid JSON in this exact shape:\n"
+        + (
+            "You have been given the ACTUAL VIDEO FILE. Watch it start to finish before answering. "
+            "Pay attention to: the exact opening frame, how the scene changes over time, the "
+            "presenter's appearance/wardrobe/age, the setting and props, camera angles and movement, "
+            "lighting, color grade, any on-screen text or captions, and the pacing.\n\n"
+            if is_video else
+            "You have been given the ACTUAL IMAGE. Study every detail: subject, wardrobe, props, "
+            "setting, composition, lighting, color grade, and any on-screen text.\n\n"
+        )
+        + (
+            "==== BIG WAVE MEDIA HOUSE PROMPT RULES (follow exactly) ====\n"
+            "The flux_prompt MUST be built from these SEVEN elements, in this order, each one specific:\n"
+            "  1. SUBJECT — the person/product described specifically (age, appearance, expression, action)\n"
+            "  2. MATERIALS / TEXTURES — fabric, surface, finish (matte, glossy, brushed metal, condensation, etc.)\n"
+            "  3. COMPOSITION / FRAMING — camera angle, distance, crop, and a named lens + f-stop (e.g. 35mm f/1.8, shot on iPhone front camera)\n"
+            "  4. LIGHTING — source, quality, direction, and color temperature (e.g. soft window light, warm 3200K)\n"
+            "  5. STYLE — photographic/mood reference, aesthetic anchor\n"
+            "  6. BACKGROUND — setting, color, depth\n"
+            "  7. RESOLUTION / FORMAT — always vertical 9:16, high-res quality tag\n"
+            "SPECIFICITY: name exact lenses, f-stops, material finishes, and color temperatures — NEVER vague terms like 'nice lighting'.\n"
+            "REALISM: always include at least one deliberate imperfection / analog descriptor (film grain, authentic skin texture, slight asymmetry, natural blemish, condensation).\n"
+            "BRANDING: do NOT invent logos or on-image text — leave those for post-production.\n"
+            "The higgsfield_prompt is a still-to-video MOTION LAYER and must specify: WHAT MOVES (hair, fabric, subtle facial movement, hands/product, particles), WHAT STAYS STILL, CAMERA BEHAVIOR (locked / slow drift / handheld micro-shake), DURATION/quality of motion (gentle sway, single gesture), and ATMOSPHERE (breath, breeze, passing light). Goal is believable real front-camera phone footage with natural blinking — NOT cinematic perfection.\n"
+            "============================================================\n\n"
+        )
+        + "Respond ONLY with valid JSON in this EXACT shape:\n"
         "{\n"
-        '  "visual_style": "one concise sentence describing the visual format/style",\n'
-        '  "hook_type": "one concise sentence describing the opening hook/angle",\n'
-        '  "tone": "a few words describing tone",\n'
-        '  "flux_prompt": "a detailed image-generation prompt to recreate a fresh iteration of this creative style (no brand names, no on-image text instructions unless key)",\n'
-        '  "higgsfield_prompt": "a detailed motion/animation prompt describing camera movement and action to animate the generated image into a video ad"\n'
-        "}\n"
-        "This is for competitive research only. Do not copy exact wording, medical claims, or the creative verbatim — describe the style so a NEW original ad can be made."
+        '  "scene_breakdown": "'
+        + ("a shot-by-shot description of what actually happens across the video timeline (opening / middle / end), including any scene or camera changes — this proves you watched it"
+           if is_video else
+           "a detailed description of exactly what is shown in the image")
+        + '",\n'
+        '  "visual_style": "2-3 sentences: format (UGC/studio/lifestyle), framing, setting, wardrobe, lighting, color grade, and production quality",\n'
+        '  "hook_type": "1-2 sentences describing the opening hook and persuasion angle",\n'
+        '  "tone": "a few descriptive words",\n'
+        '  "flux_prompt": "A single richly detailed text-to-image prompt (80-120 words) for a FRESH original still matching this creative style, built strictly from the 7 house elements above IN ORDER (Subject, Materials/Textures, Composition/Framing with named lens + f-stop, Lighting with direction + color temp, Style, Background, then end with the 9:16 format + quality tag). Include at least one deliberate imperfection/analog descriptor. No brand names, logos, or on-image text.",\n'
+        '  "higgsfield_prompt": "A still-to-video motion prompt (50-80 words) following the house motion-layer rules: what moves, what stays still, camera behavior, motion duration/quality, and atmosphere — believable front-camera UGC phone footage with natural blinking."\n'
+        "}\n\n"
+        "COMPETITIVE RESEARCH ONLY: describe the STYLE so a NEW, original ad can be produced. "
+        "Do NOT reproduce exact wording, medical/health claims, logos, or the creative verbatim."
     )
     parts.append({"text": instruction})
 
@@ -2009,6 +2042,7 @@ def analyze_ad():
 
     return jsonify({
         "ad_id":             data.get("ad_id"),
+        "scene_breakdown":   result.get("scene_breakdown", ""),
         "visual_style":      result.get("visual_style", ""),
         "hook_type":         result.get("hook_type", ""),
         "tone":              result.get("tone", ""),
