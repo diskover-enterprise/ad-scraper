@@ -1355,6 +1355,10 @@ function openGenModal() {{
             onclick="analyzeAd('${{id}}', this)">🔍 Analyze</button>
           <button class="gbtn flux" id="flux-btn-${{id}}" onclick="generateImage('${{id}}', this)" disabled>🖼 Generate Image</button>
           <button class="gbtn hf"   id="hf-btn-${{id}}"   onclick="generateVideo('${{id}}', this)"  disabled>🎬 Animate</button>
+          <button class="gbtn" style="background:#0ea5e9;color:white"
+            data-adv="${{safeAdv}}" data-title="${{safeTitle}}" data-body="${{safeBody}}"
+            data-orig-imgs="${{origImgs.join(',')}}" data-orig-vids="${{origVids.join(',')}}"
+            onclick="generateFullAd('${{id}}', this)">🎞 Generate Full Ad (5 beats)</button>
         </div>
         <div class="gen-outputs" id="outputs-${{id}}" style="display:none">
           <div class="gen-out-box">
@@ -1366,6 +1370,7 @@ function openGenModal() {{
             <div class="gen-out-content" id="hf-out-${{id}}">Generate image first</div>
           </div>
         </div>
+        <div id="beats-${{id}}" style="display:none;margin-top:14px"></div>
       </div>`;
     body.appendChild(row);
   }}
@@ -1484,6 +1489,102 @@ async function generateVideo(id, btn) {{
     btn.textContent = '🎬 Animate';
     btn.disabled    = false;
   }}
+}}
+
+// ── Full multi-beat ad generation
+async function falImage(prompt) {{
+  const r = await fetch('/generate/image', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ prompt }}) }});
+  const d = await r.json();
+  return d.image_url || null;
+}}
+
+function higgsAnimate(prompt, imageUrl) {{
+  return new Promise(async (resolve) => {{
+    try {{
+      const r = await fetch('/generate/video', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ prompt, image_url:imageUrl }}) }});
+      const d = await r.json();
+      if (!d.request_id) return resolve(null);
+      let tries = 0;
+      const poll = async () => {{
+        tries++;
+        try {{
+          const sr = await fetch('/generate/video/status', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ request_id:d.request_id }}) }});
+          const sd = await sr.json();
+          if (sd.status === 'completed' && sd.video_url) return resolve(sd.video_url);
+          if (['failed','nsfw','error'].includes(sd.status)) return resolve(null);
+          if (tries > 60) return resolve(null);
+          setTimeout(poll, 5000);
+        }} catch(e) {{ if (tries > 60) return resolve(null); setTimeout(poll, 5000); }}
+      }};
+      poll();
+    }} catch(e) {{ resolve(null); }}
+  }});
+}}
+
+async function generateFullAd(id, btn) {{
+  btn.textContent = '⏳ Scripting…';
+  btn.disabled    = true;
+  const box = document.getElementById(`beats-${{id}}`);
+  box.style.display = 'block';
+  box.innerHTML = '<div style="font-size:13px;color:#666;padding:8px">🎬 Gemini is breaking this ad into 5 beats…</div>';
+
+  // 1. Get the multi-beat script
+  let data;
+  try {{
+    const r = await fetch('/analyze/beats', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        advertiser: btn.dataset.adv, title: btn.dataset.title, body: btn.dataset.body,
+        orig_imgs: (btn.dataset.origImgs||'').split(',').filter(Boolean),
+        orig_vids: (btn.dataset.origVids||'').split(',').filter(Boolean),
+      }})
+    }});
+    data = await r.json();
+  }} catch(e) {{ data = {{ error: String(e) }}; }}
+
+  if (data.error || !data.beats) {{
+    box.innerHTML = `<div style="color:#c00;font-size:13px;padding:8px">⚠️ ${{data.error || 'No beats returned'}}</div>`;
+    btn.textContent = '🎞 Generate Full Ad (5 beats)'; btn.disabled = false;
+    return;
+  }}
+
+  // 2. Render a card per beat
+  box.innerHTML = `<div style="font-size:12px;color:#555;margin-bottom:8px"><strong>👤 Character (locked across beats):</strong> ${{data.character_description || '—'}}</div>`;
+  data.beats.forEach((b, i) => {{
+    const card = document.createElement('div');
+    card.className = 'gen-ad-row';
+    card.style.marginBottom = '10px';
+    card.innerHTML = `
+      <div style="background:#f0f6ff;padding:8px 12px;font-weight:bold;font-size:13px">Beat ${{i+1}} — ${{b.beat}}</div>
+      <div style="padding:10px 12px">
+        <div style="font-size:12px;color:#444;margin-bottom:8px"><em>"${{b.script_line || ''}}"</em></div>
+        <div class="gen-outputs" style="display:grid">
+          <div class="gen-out-box"><div class="gen-out-label">🖼 Still</div><div class="gen-out-content" id="beat-img-${{id}}-${{i}}">⏳ queued</div></div>
+          <div class="gen-out-box"><div class="gen-out-label">🎬 Clip</div><div class="gen-out-content" id="beat-vid-${{id}}-${{i}}">⏳ waiting for still</div></div>
+        </div>
+      </div>`;
+    box.appendChild(card);
+  }});
+
+  // 3. Generate each beat sequentially (still → clip), keeps API load sane
+  btn.textContent = '⏳ Rendering beats…';
+  for (let i = 0; i < data.beats.length; i++) {{
+    const b       = data.beats[i];
+    const imgCell = document.getElementById(`beat-img-${{id}}-${{i}}`);
+    const vidCell = document.getElementById(`beat-vid-${{id}}-${{i}}`);
+
+    imgCell.textContent = '⏳ generating still…';
+    const imgUrl = await falImage(b.flux_prompt);
+    if (!imgUrl) {{ imgCell.textContent = '❌ still failed'; vidCell.textContent = '— skipped'; continue; }}
+    imgCell.innerHTML = `<img src="${{imgUrl}}" style="width:100%">`;
+
+    vidCell.textContent = '🎬 animating…';
+    const vidUrl = await higgsAnimate(b.higgsfield_prompt, imgUrl);
+    if (!vidUrl) {{ vidCell.textContent = '❌ clip failed'; continue; }}
+    vidCell.innerHTML = `<video src="${{vidUrl}}" controls style="width:100%"></video>`;
+  }}
+
+  btn.textContent = '✓ Full Ad Generated';
 }}
 
 function analyzeAll() {{
@@ -2025,6 +2126,101 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
         return {"error": str(e)}
 
 
+def gemini_analyze_beats(adv, title, body, img_urls, vid_urls):
+    """Break the ad into a multi-beat UGC script with a locked character,
+    each beat carrying its own Flux + Higgsfield prompt. Returns dict or {error}."""
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    parts = []
+    media_kind = None
+    if vid_urls:
+        raw, ct = _fetch_media(vid_urls[0])
+        if raw:
+            mime = ct if ct.startswith("video/") else "video/mp4"
+            file_uri = _gemini_upload_file(raw, mime, api_key)
+            if file_uri:
+                parts.append({"file_data": {"mime_type": mime, "file_uri": file_uri}})
+                media_kind = "video"
+    if media_kind is None and img_urls:
+        raw, ct = _fetch_media(img_urls[0])
+        if raw:
+            mime = ct if ct.startswith("image/") else "image/jpeg"
+            b64  = __import__("base64").b64encode(raw).decode()
+            parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+            media_kind = "image"
+
+    instruction = (
+        f"You are a UGC ad director for Big Wave Media, reverse-engineering a competitor's "
+        f"{media_kind or 'creative'} ad for \"{adv}\" into a fresh, original 30-second UGC ad script.\n\n"
+        f"Ad headline: {title}\nAd copy: {body}\n\n"
+        "Study the creative, then design a NEW original ad broken into 5 beats following this structure: "
+        "HOOK, PROBLEM, DISCOVERY, PROOF, RESULT+CTA (about 5-6 seconds each).\n\n"
+        "CRITICAL — CHARACTER CONSISTENCY: invent ONE everyday-person spokesperson and describe them in "
+        "vivid, fixed detail (age, ethnicity, hair, face shape, distinctive features, wardrobe). This EXACT "
+        "same description must be embedded verbatim at the start of every beat's flux_prompt so the person "
+        "looks the same in every clip.\n\n"
+        "BIG WAVE HOUSE RULES for every flux_prompt: build from the 7 elements in order — Subject (the locked "
+        "character + their action this beat), Materials/Textures, Composition/Framing (named lens + f-stop, "
+        "front-facing phone-camera framing), Lighting (direction + color temp), Style, Background, then 9:16 "
+        "format + quality tag. Include a deliberate imperfection (natural skin texture, slight asymmetry). "
+        "No brand names, logos, or on-image text. Each higgsfield_prompt is a still-to-video motion layer: what "
+        "moves, what stays still, camera behavior, motion quality, atmosphere — believable front-camera UGC with "
+        "natural blinking and talking.\n\n"
+        "Respond ONLY with valid JSON in this EXACT shape:\n"
+        "{\n"
+        '  "character_description": "the locked spokesperson description reused across all beats",\n'
+        '  "beats": [\n'
+        '    {"beat": "HOOK", "script_line": "the spoken line for this beat (original, no medical claims)", '
+        '"flux_prompt": "full 7-part still prompt with the locked character baked in", '
+        '"higgsfield_prompt": "still-to-video motion prompt"},\n'
+        '    {"beat": "PROBLEM", ...},\n'
+        '    {"beat": "DISCOVERY", ...},\n'
+        '    {"beat": "PROOF", ...},\n'
+        '    {"beat": "RESULT_CTA", ...}\n'
+        "  ]\n"
+        "}\n\n"
+        "COMPETITIVE RESEARCH ONLY: original script and visuals in the same winning STYLE. "
+        "Do NOT copy exact wording, medical/health claims, logos, or the creative verbatim."
+    )
+    parts.append({"text": instruction})
+
+    try:
+        payload = json.dumps({
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.5, "response_mime_type": "application/json"},
+        }).encode()
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/models/{GEMINI_MODEL}:generateContent?key={api_key}",
+            data=payload, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        resp = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    resp = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as he:
+                if he.code in (429, 503) and attempt < 3:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise
+        text = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip()).strip()
+        parsed = json.loads(text)
+        parsed["media_kind"] = media_kind
+        return parsed
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:200]
+        except Exception: err = ""
+        print(f"[GEMINI BEATS] HTTP {e.code}: {err}")
+        return {"error": f"HTTP {e.code}: {err}"}
+    except Exception as e:
+        print(f"[GEMINI BEATS] error: {e}")
+        return {"error": str(e)}
+
+
 @app.route("/analyze", methods=["POST"])
 def analyze_ad():
     """Analyze ad creative with Gemini and generate Flux + Higgsfield prompts."""
@@ -2075,6 +2271,31 @@ def analyze_ad():
         "flux_prompt":       result.get("flux_prompt", ""),
         "higgsfield_prompt": result.get("higgsfield_prompt", ""),
         "note":              f"Analyzed {result.get('media_kind','creative')} with Gemini",
+    })
+
+
+@app.route("/analyze/beats", methods=["POST"])
+def analyze_beats():
+    """Break an ad into a multi-beat UGC script with a locked character."""
+    data  = request.json or {}
+    adv   = data.get("advertiser", "the brand")
+    title = data.get("title", "")
+    body  = data.get("body", "")
+    imgs  = data.get("orig_imgs", [])
+    vids  = data.get("orig_vids", [])
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        return jsonify({"error": "Set GEMINI_API_KEY to generate multi-beat scripts"}), 400
+
+    result = gemini_analyze_beats(adv, title, body, imgs, vids)
+    if result.get("error"):
+        return jsonify({"error": result["error"]}), 502
+    beats = result.get("beats") or []
+    if not beats:
+        return jsonify({"error": "No beats returned"}), 502
+    return jsonify({
+        "character_description": result.get("character_description", ""),
+        "beats": beats,
     })
 
 
