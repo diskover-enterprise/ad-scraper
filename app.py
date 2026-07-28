@@ -1397,7 +1397,8 @@ async function analyzeAd(id, btn) {{
     const r    = await fetch('/analyze', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload) }});
     const data = await r.json();
     const el   = document.getElementById(`analysis-${{id}}`);
-    el.innerHTML = `${{data.scene_breakdown ? `<strong>🎬 What Gemini saw:</strong> ${{data.scene_breakdown}}<br><br>` : ''}}
+    el.innerHTML = `${{data.transcript ? `<strong>📝 Transcript (competitor's actual script):</strong><br><span style="white-space:pre-wrap">${{data.transcript}}</span><br><br>` : ''}}
+                    ${{data.scene_breakdown ? `<strong>🎬 What Gemini saw:</strong> ${{data.scene_breakdown}}<br><br>` : ''}}
                     <strong>Visual Style:</strong> ${{data.visual_style}}<br>
                     <strong>Hook Type:</strong> ${{data.hook_type}}<br>
                     <strong>Tone:</strong> ${{data.tone}}
@@ -1549,7 +1550,9 @@ async function generateFullAd(id, btn) {{
   }}
 
   // 2. Render a card per beat
-  box.innerHTML = `<div style="font-size:12px;color:#555;margin-bottom:8px"><strong>👤 Character (locked across beats):</strong> ${{data.character_description || '—'}}</div>`;
+  box.innerHTML = `
+    ${{data.transcript ? `<div style="font-size:12px;color:#555;margin-bottom:8px;background:#fffef0;padding:8px 10px;border-radius:6px"><strong>📝 Competitor transcript (reference):</strong><br><span style="white-space:pre-wrap">${{data.transcript}}</span></div>` : ''}}
+    <div style="font-size:12px;color:#555;margin-bottom:8px"><strong>👤 Character (locked across beats):</strong> ${{data.character_description || '—'}}</div>`;
   data.beats.forEach((b, i) => {{
     const card = document.createElement('div');
     card.className = 'gen-ad-row';
@@ -2073,6 +2076,11 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
         )
         + "Respond ONLY with valid JSON in this EXACT shape:\n"
         "{\n"
+        '  "transcript": "'
+        + ("the competitor's ACTUAL spoken words transcribed verbatim from the audio, plus any on-screen text/captions in [brackets]. This is for research study only. If there is no speech, describe the on-screen text."
+           if is_video else
+           "any on-screen text/copy visible in the image, transcribed verbatim")
+        + '",\n'
         '  "scene_breakdown": "'
         + ("a shot-by-shot description of what actually happens across the video timeline (opening / middle / end), including any scene or camera changes — this proves you watched it"
            if is_video else
@@ -2155,8 +2163,10 @@ def gemini_analyze_beats(adv, title, body, img_urls, vid_urls):
         f"You are a UGC ad director for Big Wave Media, reverse-engineering a competitor's "
         f"{media_kind or 'creative'} ad for \"{adv}\" into a fresh, original 30-second UGC ad script.\n\n"
         f"Ad headline: {title}\nAd copy: {body}\n\n"
-        "Study the creative, then design a NEW original ad broken into 5 beats following this structure: "
-        "HOOK, PROBLEM, DISCOVERY, PROOF, RESULT+CTA (about 5-6 seconds each).\n\n"
+        "FIRST, transcribe the competitor's actual spoken words (and on-screen captions) verbatim for study. "
+        "THEN, using that transcript's hook, structure, and pacing as reference, design a NEW original ad "
+        "broken into 5 beats: HOOK, PROBLEM, DISCOVERY, PROOF, RESULT+CTA (about 5-6 seconds each). "
+        "The new script_lines must be freshly reworded — same persuasive beats, NOT the competitor's exact words or claims.\n\n"
         "CRITICAL — CHARACTER CONSISTENCY: invent ONE everyday-person spokesperson and describe them in "
         "vivid, fixed detail (age, ethnicity, hair, face shape, distinctive features, wardrobe). This EXACT "
         "same description must be embedded verbatim at the start of every beat's flux_prompt so the person "
@@ -2170,6 +2180,7 @@ def gemini_analyze_beats(adv, title, body, img_urls, vid_urls):
         "natural blinking and talking.\n\n"
         "Respond ONLY with valid JSON in this EXACT shape:\n"
         "{\n"
+        '  "transcript": "the competitor\'s actual spoken words + on-screen captions, transcribed verbatim (research reference only)",\n'
         '  "character_description": "the locked spokesperson description reused across all beats",\n'
         '  "beats": [\n'
         '    {"beat": "HOOK", "script_line": "the spoken line for this beat (original, no medical claims)", '
@@ -2264,6 +2275,7 @@ def analyze_ad():
 
     return jsonify({
         "ad_id":             data.get("ad_id"),
+        "transcript":        result.get("transcript", ""),
         "scene_breakdown":   result.get("scene_breakdown", ""),
         "visual_style":      result.get("visual_style", ""),
         "hook_type":         result.get("hook_type", ""),
@@ -2294,6 +2306,7 @@ def analyze_beats():
     if not beats:
         return jsonify({"error": "No beats returned"}), 502
     return jsonify({
+        "transcript": result.get("transcript", ""),
         "character_description": result.get("character_description", ""),
         "beats": beats,
     })
