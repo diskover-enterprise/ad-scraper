@@ -1439,22 +1439,48 @@ async function generateImage(id, btn) {{
 async function generateVideo(id, btn) {{
   const prompt  = document.getElementById(`hf-prompt-${{id}}`).value;
   const imgUrl  = btn.dataset.imgUrl || '';
-  btn.textContent = '⏳ Animating…';
+  const out     = document.getElementById(`hf-out-${{id}}`);
+  btn.textContent = '⏳ Submitting…';
   btn.disabled    = true;
-  document.getElementById(`hf-out-${{id}}`).innerHTML = '⏳ Calling Higgsfield…';
+  out.textContent = '⏳ Submitting to Higgsfield…';
   try {{
     const r    = await fetch('/generate/video', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ ad_id:id, prompt, image_url:imgUrl }}) }});
     const data = await r.json();
-    const out  = document.getElementById(`hf-out-${{id}}`);
-    if (data.video_url) {{
-      out.innerHTML = `<video src="${{data.video_url}}" controls style="width:100%"></video>`;
-    }} else {{
-      out.textContent = data.message || 'No video returned';
+    if (data.status === 'error' || !data.request_id) {{
+      out.textContent = data.message || 'Submit failed';
+      btn.textContent = '🎬 Animate'; btn.disabled = false;
+      return;
     }}
-    btn.textContent = '🎬 Reanimate';
-    btn.disabled    = false;
+    // Poll for completion (video gen takes 30s–a few minutes)
+    const rid = data.request_id;
+    out.textContent = '🎬 Generating video… (this can take a minute or two)';
+    btn.textContent = '⏳ Rendering…';
+    let tries = 0;
+    const poll = async () => {{
+      tries++;
+      try {{
+        const sr = await fetch('/generate/video/status', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ request_id: rid }}) }});
+        const sd = await sr.json();
+        if (sd.status === 'completed' && sd.video_url) {{
+          out.innerHTML = `<video src="${{sd.video_url}}" controls style="width:100%"></video>`;
+          btn.textContent = '🎬 Reanimate'; btn.disabled = false;
+          return;
+        }}
+        if (sd.status === 'failed' || sd.status === 'nsfw' || sd.status === 'error') {{
+          out.textContent = '❌ ' + (sd.message || sd.status);
+          btn.textContent = '🎬 Animate'; btn.disabled = false;
+          return;
+        }}
+        if (tries > 60) {{ out.textContent = '⚠️ Timed out — try again'; btn.textContent = '🎬 Animate'; btn.disabled = false; return; }}
+        setTimeout(poll, 5000);  // poll every 5s, up to ~5 min
+      }} catch(e) {{
+        if (tries > 60) {{ out.textContent = '❌ Polling error'; btn.textContent = '🎬 Animate'; btn.disabled = false; return; }}
+        setTimeout(poll, 5000);
+      }}
+    }};
+    poll();
   }} catch(e) {{
-    document.getElementById(`hf-out-${{id}}`).textContent = '❌ Error';
+    out.textContent = '❌ Error';
     btn.textContent = '🎬 Animate';
     btn.disabled    = false;
   }}
@@ -2052,41 +2078,134 @@ def analyze_ad():
     })
 
 
+# Flux model on fal.ai — overridable via env var (flux/dev, flux/schnell, flux-pro/v1.1)
+FAL_MODEL = os.environ.get("FAL_MODEL", "fal-ai/flux/dev")
+
 @app.route("/generate/image", methods=["POST"])
 def generate_image():
-    """
-    Generate static image with Flux via fal.ai.
-    PLACEHOLDER — set FAL_API_KEY env var to enable real generation.
-    """
+    """Generate a 9:16 still with Flux via fal.ai (synchronous)."""
     data   = request.json or {}
     prompt = data.get("prompt", "")
-    print(f"[FLUX PLACEHOLDER] {prompt[:120]}")
-    # TODO: fal_client.submit("fal-ai/flux/dev", arguments={"prompt": prompt})
-    return jsonify({
-        "status":    "placeholder",
-        "image_url": "https://placehold.co/800x800/6366f1/white?text=Flux+Image%0AAdd+FAL_API_KEY",
-        "message":   "Placeholder — set FAL_API_KEY in Railway env vars to enable Flux generation",
-    })
+    fal_key = os.environ.get("FAL_API_KEY", "")
 
+    if not fal_key:
+        return jsonify({
+            "status":    "placeholder",
+            "image_url": "https://placehold.co/720x1280/6366f1/white?text=Add+FAL_API_KEY",
+            "message":   "Placeholder — set FAL_API_KEY in Railway env vars to enable Flux",
+        })
+    if not prompt.strip():
+        return jsonify({"status": "error", "message": "Empty prompt"}), 400
+
+    try:
+        payload = json.dumps({
+            "prompt":              prompt,
+            "image_size":          "portrait_16_9",   # vertical 9:16 per SOP
+            "num_images":          1,
+            "enable_safety_checker": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"https://fal.run/{FAL_MODEL}",
+            data=payload,
+            headers={
+                "Authorization": f"Key {fal_key}",
+                "Content-Type":  "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=90) as r:
+            resp = json.loads(r.read())
+        imgs = resp.get("images") or []
+        url  = imgs[0].get("url") if imgs and isinstance(imgs[0], dict) else None
+        if not url:
+            return jsonify({"status": "error", "image_url": None, "message": "No image returned"}), 502
+        return jsonify({"status": "completed", "image_url": url, "message": "Generated with Flux"})
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:250]
+        except Exception: err = ""
+        print(f"[FLUX] HTTP {e.code}: {err}")
+        return jsonify({"status": "error", "image_url": None, "message": f"HTTP {e.code}: {err}"}), 502
+    except Exception as e:
+        print(f"[FLUX] error: {e}")
+        return jsonify({"status": "error", "image_url": None, "message": str(e)}), 502
+
+
+# Higgsfield image-to-video model — overridable via env var
+HIGGSFIELD_MODEL = os.environ.get("HIGGSFIELD_MODEL", "higgsfield-ai/dop/standard")
+
+def _higgsfield_auth():
+    key    = os.environ.get("HIGGSFIELD_API_KEY", "")
+    secret = os.environ.get("HIGGSFIELD_API_SECRET", "")
+    if not key or not secret:
+        return None
+    return f"Key {key}:{secret}"
 
 @app.route("/generate/video", methods=["POST"])
 def generate_video():
-    """
-    Animate image to video with Higgsfield.
-    PLACEHOLDER — set HIGGSFIELD_API_KEY env var to enable real animation.
-    """
+    """Submit an image-to-video job to Higgsfield. Returns request_id for polling."""
     data      = request.json or {}
     prompt    = data.get("prompt", "")
     image_url = data.get("image_url", "")
-    print(f"[HIGGSFIELD PLACEHOLDER] img={image_url[:60]} prompt={prompt[:80]}")
-    # TODO: POST https://platform.higgsfield.ai/higgsfield-ai/dop/standard
-    #       headers: Authorization: Key {HIGGSFIELD_API_KEY}
-    #       body: { image_url, prompt, duration: 5 }
-    return jsonify({
-        "status":    "placeholder",
-        "video_url": None,
-        "message":   "Placeholder — set HIGGSFIELD_API_KEY in Railway env vars to enable Higgsfield animation",
-    })
+
+    auth = _higgsfield_auth()
+    if not auth:
+        return jsonify({"status": "error",
+                        "message": "Set HIGGSFIELD_API_KEY + HIGGSFIELD_API_SECRET in Railway env vars"}), 400
+    if not image_url:
+        return jsonify({"status": "error", "message": "Generate an image first"}), 400
+
+    try:
+        payload = json.dumps({
+            "image_url": image_url,
+            "prompt":    prompt,
+            "duration":  5,
+        }).encode()
+        req = urllib.request.Request(
+            f"https://platform.higgsfield.ai/{HIGGSFIELD_MODEL}",
+            data=payload,
+            headers={"Authorization": auth, "Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+        return jsonify({
+            "status":     resp.get("status", "queued"),
+            "request_id": resp.get("request_id", ""),
+        })
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:250]
+        except Exception: err = ""
+        print(f"[HIGGSFIELD] HTTP {e.code}: {err}")
+        return jsonify({"status": "error", "message": f"HTTP {e.code}: {err}"}), 502
+    except Exception as e:
+        print(f"[HIGGSFIELD] error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 502
+
+@app.route("/generate/video/status", methods=["POST"])
+def generate_video_status():
+    """Poll Higgsfield for a request's status. Returns video_url when completed."""
+    data = request.json or {}
+    rid  = data.get("request_id", "")
+    auth = _higgsfield_auth()
+    if not auth or not rid:
+        return jsonify({"status": "error", "message": "Missing request_id or credentials"}), 400
+    try:
+        req = urllib.request.Request(
+            f"https://platform.higgsfield.ai/requests/{rid}/status",
+            headers={"Authorization": auth, "Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+        status    = resp.get("status", "")
+        video_url = (resp.get("video") or {}).get("url") if isinstance(resp.get("video"), dict) else None
+        return jsonify({"status": status, "video_url": video_url})
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:250]
+        except Exception: err = ""
+        return jsonify({"status": "error", "message": f"HTTP {e.code}: {err}"}), 502
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 502
 
 
 @app.route("/logs")
