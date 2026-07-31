@@ -119,17 +119,31 @@ def fb_page_to_adlib_url(page_url, status, country):
     """
     if not page_url:
         return None
-    # If it's already an Ad Library URL, use it as-is
+    page_url = page_url.strip()
+    # If it's already a full Ad Library URL, use it as-is
     if "facebook.com/ads/library" in page_url:
         return page_url
     page_id = None
-    # profile.php?id=123...  OR any ...id=123...
-    m = re.search(r"[?&]id=(\d+)", page_url)
+    # view_all_page_id=123...  (Ad Library page param, even as a fragment)
+    m = re.search(r"view_all_page_id=(\d+)", page_url)
     if m:
         page_id = m.group(1)
+    # profile.php?id=123...  or ?id=123 / &id=123
     if not page_id:
-        # /pages/Name/123456  or trailing /123456
-        m = re.search(r"/(\d{6,})/?(?:\?|$)", page_url)
+        m = re.search(r"[?&]id=(\d+)", page_url)
+        if m:
+            page_id = m.group(1)
+    # A bare numeric ID pasted on its own
+    if not page_id and page_url.isdigit():
+        page_id = page_url
+    # /pages/Name/123456  or trailing /123456
+    if not page_id:
+        m = re.search(r"/(\d{6,})/?(?:[?#]|$)", page_url)
+        if m:
+            page_id = m.group(1)
+    # Any long digit run as a last resort
+    if not page_id:
+        m = re.search(r"(\d{10,})", page_url)
         if m:
             page_id = m.group(1)
     if not page_id:
