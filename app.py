@@ -134,9 +134,11 @@ def fb_page_to_adlib_url(page_url, status, country):
             page_id = m.group(1)
     if not page_id:
         return None
+    # For a page search we want ALL of that advertiser's ads, so don't restrict
+    # by country or active status (those filters commonly zero-out real results).
     return (
         f"https://www.facebook.com/ads/library/"
-        f"?active_status={status}&ad_type=all&country={country}"
+        f"?active_status=all&ad_type=all&country=ALL"
         f"&view_all_page_id={page_id}&search_type=page&media_type=all"
     )
 
