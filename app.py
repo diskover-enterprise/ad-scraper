@@ -113,6 +113,34 @@ def wait_for_run(run_id, log, poll=5, timeout=300):
 
 # ── Ad data helpers ───────────────────────────────────────────────────────────
 
+def fb_page_to_adlib_url(page_url, status, country):
+    """Convert a Facebook page/profile URL into a Meta Ad Library page-search URL.
+    Handles profile.php?id=NUMERIC and /pages/.../NUMERIC. Returns None if no ID found.
+    """
+    if not page_url:
+        return None
+    # If it's already an Ad Library URL, use it as-is
+    if "facebook.com/ads/library" in page_url:
+        return page_url
+    page_id = None
+    # profile.php?id=123...  OR any ...id=123...
+    m = re.search(r"[?&]id=(\d+)", page_url)
+    if m:
+        page_id = m.group(1)
+    if not page_id:
+        # /pages/Name/123456  or trailing /123456
+        m = re.search(r"/(\d{6,})/?(?:\?|$)", page_url)
+        if m:
+            page_id = m.group(1)
+    if not page_id:
+        return None
+    return (
+        f"https://www.facebook.com/ads/library/"
+        f"?active_status={status}&ad_type=all&country={country}"
+        f"&view_all_page_id={page_id}&search_type=page&media_type=all"
+    )
+
+
 def extract_urls(ad):
     """Return (images[], videos[]) from a curious_coder ad record.
     Field names confirmed snake_case from debug output.
@@ -127,14 +155,16 @@ def extract_urls(ad):
         if v and isinstance(v, str) and v not in vids:
             vids.append(v)
 
+    def add_one_img(obj):
+        """Add just ONE url per image object (variants of the same picture)."""
+        if isinstance(obj, dict):
+            add_img(obj.get("resized_image_url") or obj.get("original_image_url") or obj.get("url"))
+        elif isinstance(obj, str):
+            add_img(obj)
+
     # snapshot.images[] — objects with resized_image_url / original_image_url / url
     for img_obj in snap.get("images") or []:
-        if isinstance(img_obj, dict):
-            add_img(img_obj.get("resized_image_url"))
-            add_img(img_obj.get("original_image_url"))
-            add_img(img_obj.get("url"))
-        elif isinstance(img_obj, str):
-            add_img(img_obj)
+        add_one_img(img_obj)
 
     # snapshot.videos[]
     for vid_obj in snap.get("videos") or []:
@@ -147,22 +177,15 @@ def extract_urls(ad):
         elif isinstance(vid_obj, str):
             add_vid(vid_obj)
 
-    # Carousel cards
+    # Carousel cards — one image per card
     for card in snap.get("cards") or []:
-        add_img(card.get("resized_image_url"))
-        add_img(card.get("original_image_url"))
-        add_img(card.get("url"))
+        add_img(card.get("resized_image_url") or card.get("original_image_url") or card.get("url"))
         add_vid(card.get("video_hd_url"))
         add_vid(card.get("video_sd_url"))
 
     # extra_images / extra_videos (confirmed in snapshot keys)
     for img_obj in snap.get("extra_images") or []:
-        if isinstance(img_obj, dict):
-            add_img(img_obj.get("resized_image_url"))
-            add_img(img_obj.get("original_image_url"))
-            add_img(img_obj.get("url"))
-        elif isinstance(img_obj, str):
-            add_img(img_obj)
+        add_one_img(img_obj)
     for vid_obj in snap.get("extra_videos") or []:
         if isinstance(vid_obj, dict):
             add_vid(vid_obj.get("video_hd_url"))
@@ -171,9 +194,9 @@ def extract_urls(ad):
         elif isinstance(vid_obj, str):
             add_vid(vid_obj)
 
-    # Top-level snapshot fallbacks
-    add_img(snap.get("resized_image_url"))
-    add_img(snap.get("original_image_url"))
+    # Top-level snapshot fallbacks — one image only
+    if not imgs:
+        add_img(snap.get("resized_image_url") or snap.get("original_image_url"))
     add_vid(snap.get("video_hd_url"))
     add_vid(snap.get("video_sd_url"))
 
@@ -483,9 +506,14 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status, cooki
                             f"?active_status={_status}&ad_type=all&country={_country}"
                             f"&q={urlquote(domain)}&search_type=page_like_and_ads_using_domain&media_type=all"
                         )})
-                    # Page URL: pull all ads from a specific Facebook page
+                    # Page URL: convert to an Ad Library page-search URL first
                     if page_url:
-                        urls.append({"url": page_url})
+                        adlib = fb_page_to_adlib_url(page_url, _status, _country)
+                        if adlib:
+                            urls.append({"url": adlib})
+                            log(f"   📄 Page → Ad Library: {adlib}")
+                        else:
+                            log(f"   ⚠️ Couldn't extract a page ID from: {page_url}")
 
                 if not urls:
                     results[i] = []
