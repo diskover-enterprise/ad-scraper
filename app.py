@@ -565,6 +565,14 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status, cooki
                 unique.append(ad)
 
         log(f"📊 {len(unique)} unique ads")
+        # DEBUG: dump snapshot structure of the first ad with no extractable creative
+        for ad in unique:
+            imgs_dbg, vids_dbg = extract_urls(ad)
+            if not imgs_dbg and not vids_dbg:
+                snap_dbg = ad.get("snapshot") or {}
+                print(f"[NOCREATIVE] snapshot keys = {list(snap_dbg.keys())}")
+                print(f"[NOCREATIVE] sample = {json.dumps(snap_dbg)[:1200]}")
+                break
         translate_ads_bulk(unique, log)
         job["html"]   = build_viewer(brand, country, unique)
         job["status"] = "done"
