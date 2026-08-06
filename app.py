@@ -959,9 +959,9 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   </select>
   <select class="sort-sel" onchange="sortCards(this.value)">
     <option value="">Sort: default</option>
-    <option value="imp_desc" selected>Impressions ↓</option>
-    <option value="date_desc">Newest first</option>
-    <option value="date_asc">Oldest first</option>
+    <option value="date_desc" selected>Active since (newest)</option>
+    <option value="date_asc">Active since (oldest)</option>
+    <option value="imp_desc">Impressions ↓</option>
     <option value="advertiser">Advertiser A–Z</option>
   </select>
   <div class="view-toggle">
@@ -1055,7 +1055,7 @@ function matchPeriod(el) {{
 }}
 
 // Default sort: impressions descending
-sortCards('imp_desc');
+sortCards('date_desc');
 
 // ── View toggle
 function setView(v) {{
