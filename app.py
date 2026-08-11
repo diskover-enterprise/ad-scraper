@@ -494,9 +494,13 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
 
 # ── Scrape worker ─────────────────────────────────────────────────────────────
 
-def run_job(job_id, brand, country, searches, domain, page_url, ad_status, cookies=None):
+def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, cookies=None):
     job = jobs[job_id]
     def log(msg): job["log"].append(msg)
+
+    # Backward-compat: allow single string for domains/page_urls
+    if isinstance(domains, str):   domains   = [domains]   if domains   else []
+    if isinstance(page_urls, str): page_urls = [page_urls] if page_urls else []
 
     try:
         _country = country or "US"
@@ -515,15 +519,16 @@ def run_job(job_id, brand, country, searches, domain, page_url, ad_status, cooki
                     for q in queries if q.strip()
                 ]
                 if i == 0:
-                    # Domain search: find all advertisers running ads to this domain
-                    if domain:
+                    # Domain searches: find all advertisers driving to each domain
+                    for domain in domains:
                         urls.append({"url": (
                             f"https://www.facebook.com/ads/library/"
                             f"?active_status={_status}&ad_type=all&country={_country}"
                             f"&q={urlquote(domain)}&search_type=page_like_and_ads_using_domain&media_type=all"
                         )})
-                    # Page URL: convert to an Ad Library page-search URL first
-                    if page_url:
+                        log(f"   🌐 Domain search: {domain}")
+                    # Page searches: convert each to an Ad Library page-search URL
+                    for page_url in page_urls:
                         adlib = fb_page_to_adlib_url(page_url, _status, _country)
                         if adlib:
                             urls.append({"url": adlib})
@@ -1357,7 +1362,7 @@ function openGenModal() {{
   let idx = 0;
   for (const card of selected) {{
     idx++;
-    const id       = (card.dataset.lib || '').match(/id=(\d+)/)?.[1] || idx;
+    const id       = (card.dataset.lib || '').match(/id=([0-9]+)/)?.[1] || idx;
     const adv      = card.dataset.advertiser || 'Unknown';
     const fmt      = card.dataset.fmt || 'IMAGE';
     const bodyTxt  = (card.dataset.body  || '').slice(0, 150);
@@ -1782,22 +1787,19 @@ input:focus,select:focus{border-color:#1877f2;box-shadow:0 0 0 3px rgba(24,119,2
     </div>
 
     <div class="divider">
-      <label>Keywords / Search Terms <span style="font-weight:normal;color:#aaa">(one group per row, comma-separated)</span></label>
-      <div id="searches">
-        <div class="search-row">
-          <input name="search[]" placeholder="e.g. weight loss, fat burner">
-          <button type="button" class="remove-btn" onclick="removeRow(this)" title="Remove">&#x2715;</button>
-        </div>
-      </div>
-      <button type="button" class="add-btn" onclick="addRow()">+ Add keyword group</button>
+      <label>Keywords / Search Terms <span style="font-weight:normal;color:#aaa">(one search per line — paste as many as you want)</span></label>
+      <textarea name="keywords_bulk" placeholder="weight loss&#10;fat burner&#10;glp1&#10;semaglutide"
+        style="width:100%;height:90px;padding:9px 12px;border:1px solid #ddd;border-radius:7px;font-size:14px;resize:vertical;outline:none;color:#1a1a1a"></textarea>
     </div>
 
     <div class="divider">
-      <label>Landing Page / Domain <span style="font-weight:normal;color:#aaa">(optional — finds all advertisers driving traffic to this domain)</span></label>
-      <input name="domain" placeholder="e.g. get-novaburn.com">
+      <label>Landing Pages / Domains <span style="font-weight:normal;color:#aaa">(optional — one per line — finds advertisers driving traffic to each)</span></label>
+      <textarea name="domains_bulk" placeholder="get-novaburn.com&#10;trimrx.com&#10;quad.medvi.org"
+        style="width:100%;height:70px;padding:9px 12px;border:1px solid #ddd;border-radius:7px;font-size:14px;resize:vertical;outline:none;color:#1a1a1a"></textarea>
 
-      <label style="margin-top:14px">Competitor Facebook Page URL <span style="font-weight:normal;color:#aaa">(optional)</span></label>
-      <input name="page_url" placeholder="e.g. https://www.facebook.com/BeyondTheScale">
+      <label style="margin-top:14px">Competitor Facebook Pages <span style="font-weight:normal;color:#aaa">(optional — one URL or page ID per line)</span></label>
+      <textarea name="pages_bulk" placeholder="153085624560230&#10;https://www.facebook.com/ads/library/?...view_all_page_id=123..."
+        style="width:100%;height:70px;padding:9px 12px;border:1px solid #ddd;border-radius:7px;font-size:14px;resize:vertical;outline:none;color:#1a1a1a"></textarea>
     </div>
 
     <div class="divider">
@@ -1937,22 +1939,31 @@ def home():
 
 @app.route("/start", methods=["POST"])
 def start():
-    country      = request.form.get("country", "US")
-    ad_status    = request.form.get("ad_status", "active")
-    domain_input = request.form.get("domain", "").strip()
-    page_url     = request.form.get("page_url", "").strip()
-    searches_raw = request.form.getlist("search[]")
-    searches     = [[q.strip() for q in s.split(",") if q.strip()] for s in searches_raw if s.strip()]
-    first_kw     = searches_raw[0].strip() if searches_raw else ""
-    brand        = domain_input or page_url or first_kw or "Meta Ads"  # label for results page only
+    country   = request.form.get("country", "US")
+    ad_status = request.form.get("ad_status", "active")
 
-    # Extract clean domain (handles full URLs like https://trimrx.com/path?query=1)
-    domain = ""
-    if domain_input:
-        raw = domain_input if "://" in domain_input else "https://" + domain_input
-        domain = urlparse(raw).netloc  # strips path, query, fragment — just hostname
+    def split_lines(field):
+        return [ln.strip() for ln in request.form.get(field, "").splitlines() if ln.strip()]
 
-    # If domain/page_url provided but no keywords, fire one thread with just those
+    # Bulk keywords — one search per line (comma within a line = OR group)
+    kw_lines = split_lines("keywords_bulk")
+    searches = [[q.strip() for q in ln.split(",") if q.strip()] for ln in kw_lines]
+
+    # Bulk domains — clean each to a bare hostname
+    domains = []
+    for d in split_lines("domains_bulk"):
+        raw = d if "://" in d else "https://" + d
+        host = urlparse(raw).netloc or d
+        if host:
+            domains.append(host)
+
+    # Bulk Facebook pages — URLs or bare IDs
+    page_urls = split_lines("pages_bulk")
+
+    first_kw = kw_lines[0] if kw_lines else ""
+    brand    = first_kw or (domains[0] if domains else "") or (page_urls[0] if page_urls else "") or "Meta Ads"
+
+    # If only domains/pages provided (no keywords), still fire one thread
     if not searches:
         searches = [[]]
 
@@ -1979,7 +1990,7 @@ def start():
 
     threading.Thread(
         target=run_job,
-        args=(job_id, brand, country, searches, domain, page_url, ad_status),
+        args=(job_id, brand, country, searches, domains, page_urls, ad_status),
         kwargs={"cookies": cookies},
         daemon=True
     ).start()
