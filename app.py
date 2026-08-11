@@ -1470,25 +1470,44 @@ async function analyzeAd(id, btn) {{
 
 async function generateImage(id, btn) {{
   const prompt = document.getElementById(`flux-prompt-${{id}}`).value;
+  const out    = document.getElementById(`flux-out-${{id}}`);
   btn.textContent = '⏳ Generating…';
   btn.disabled    = true;
-  document.getElementById(`flux-out-${{id}}`).innerHTML = '⏳ Calling Flux…';
+  out.innerHTML   = '⏳ Calling Higgsfield…';
+  const showImage = (url) => {{
+    out.innerHTML = `<img src="${{url}}" alt="Generated">`;
+    const hfBtn = document.getElementById(`hf-btn-${{id}}`);
+    hfBtn.disabled = false;
+    hfBtn.dataset.imgUrl = url;
+    btn.textContent = '🖼 Regenerate';
+    btn.disabled = false;
+  }};
   try {{
     const r    = await fetch('/generate/image', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ ad_id:id, prompt }}) }});
     const data = await r.json();
-    const out  = document.getElementById(`flux-out-${{id}}`);
-    if (data.image_url) {{
-      out.innerHTML = `<div><img src="${{data.image_url}}" alt="Generated">${{data.message ? `<div style="padding:6px 8px;font-size:11px;color:#888">${{data.message}}</div>` : ''}}</div>`;
-      const hfBtn = document.getElementById(`hf-btn-${{id}}`);
-      hfBtn.disabled    = false;
-      hfBtn.dataset.imgUrl = data.image_url;
-    }} else {{
+    if (data.image_url) {{ showImage(data.image_url); return; }}
+    if (data.status === 'error' || !data.request_id) {{
       out.textContent = data.message || 'No image returned';
+      btn.textContent = '🖼 Generate Image'; btn.disabled = false; return;
     }}
-    btn.textContent = '🖼 Regenerate';
-    btn.disabled    = false;
+    // Poll for the image
+    const rid = data.request_id;
+    out.textContent = '🖼 Rendering image…';
+    let tries = 0;
+    const poll = async () => {{
+      tries++;
+      try {{
+        const sr = await fetch('/generate/image/status', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ request_id: rid }}) }});
+        const sd = await sr.json();
+        if (sd.image_url) {{ showImage(sd.image_url); return; }}
+        if (['failed','nsfw','error'].includes(sd.status)) {{ out.textContent = '❌ ' + (sd.message || sd.status); btn.textContent='🖼 Generate Image'; btn.disabled=false; return; }}
+        if (tries > 60) {{ out.textContent = '⚠️ Timed out'; btn.textContent='🖼 Generate Image'; btn.disabled=false; return; }}
+        setTimeout(poll, 4000);
+      }} catch(e) {{ if (tries > 60) {{ out.textContent='❌ Polling error'; btn.textContent='🖼 Generate Image'; btn.disabled=false; return; }} setTimeout(poll, 4000); }}
+    }};
+    poll();
   }} catch(e) {{
-    document.getElementById(`flux-out-${{id}}`).textContent = '❌ Error';
+    out.textContent = '❌ Error';
     btn.textContent = '🖼 Generate Image';
     btn.disabled    = false;
   }}
@@ -1545,10 +1564,29 @@ async function generateVideo(id, btn) {{
 }}
 
 // ── Full multi-beat ad generation
-async function falImage(prompt) {{
-  const r = await fetch('/generate/image', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ prompt }}) }});
-  const d = await r.json();
-  return {{ url: d.image_url || null, message: d.message || '' }};
+function falImage(prompt) {{
+  // Submit to Higgsfield image, then poll until the URL is ready.
+  return new Promise(async (resolve) => {{
+    try {{
+      const r = await fetch('/generate/image', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ prompt }}) }});
+      const d = await r.json();
+      if (d.image_url) return resolve({{ url: d.image_url, message: '' }});
+      if (!d.request_id) return resolve({{ url: null, message: d.message || 'failed' }});
+      let tries = 0;
+      const poll = async () => {{
+        tries++;
+        try {{
+          const sr = await fetch('/generate/image/status', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{ request_id: d.request_id }}) }});
+          const sd = await sr.json();
+          if (sd.image_url) return resolve({{ url: sd.image_url, message: '' }});
+          if (['failed','nsfw','error'].includes(sd.status)) return resolve({{ url: null, message: sd.message || sd.status }});
+          if (tries > 60) return resolve({{ url: null, message: 'timed out' }});
+          setTimeout(poll, 4000);
+        }} catch(e) {{ if (tries > 60) return resolve({{ url: null, message: 'poll error' }}); setTimeout(poll, 4000); }}
+      }};
+      poll();
+    }} catch(e) {{ resolve({{ url: null, message: String(e) }}); }}
+  }});
 }}
 
 async function genVoice(text) {{
@@ -2040,8 +2078,8 @@ FILTER_SAFE_RULES = (
     "- Wardrobe: everyday casual/modest clothing. No lingerie, nudity, swimwear, or revealing/suggestive poses.\n"
     "- Setting: normal home/kitchen/gym/outdoor lifestyle. Subject simply speaking to camera, smiling, holding the product.\n"
     "- No sexual innuendo in the VISUAL description. The persuasion/edge belongs in the ad COPY and landing page, not the rendered footage.\n"
-    "- If the source ad is sexual in nature, translate the ENERGY (confidence, relief, excitement) into a clean, everyday testimonial visual.\n"
-    "This is how compliant advertisers pass generation filters: tame visual, punchy copy.\n"
+    "- If the source ad is sexual/explicit, KEEP THE SAME creative FORMAT and energy (surreal graphic, bold product hero, comparison, etc.) but make it clean — remove nudity, bikinis, and suggestive posing. Do NOT switch a graphic/product ad into a generic person testimonial just to sanitize it.\n"
+    "This is how compliant advertisers pass generation filters: same bold format, clean visual, punchy copy.\n"
     "==============================================================\n\n"
 )
 
@@ -2149,18 +2187,25 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
         )
         + (
             "==== BIG WAVE MEDIA HOUSE PROMPT RULES (follow exactly) ====\n"
-            "The flux_prompt MUST be built from these SEVEN elements, in this order, each one specific:\n"
-            "  1. SUBJECT — the person/product described specifically (age, appearance, expression, action)\n"
+            "STEP 1 — REPLICATE AS CLOSELY AS POSSIBLE. Recreate this exact ad as faithfully as you can: match the "
+            "FORMAT, composition/layout, subject and pose, props, color palette, color grade, lighting style, mood, "
+            "and where any bold text sits. The goal is a near-twin in the same style. Change ONLY what's required to "
+            "(a) keep it original — no copied brand logos or verbatim claims, and (b) keep it filter-safe — no nudity, "
+            "bikinis, or explicit/suggestive content. Do NOT default to a UGC talking-head. If the ad is a surreal "
+            "graphic product ad, your recreation must ALSO be a surreal graphic product ad with the same composition and energy.\n"
+            "STEP 2 — Build the flux_prompt from these SEVEN elements in order, describing the ACTUAL subject of "
+            "THIS ad (which may be a person, a product, or a surreal scene — not necessarily a person):\n"
+            "  1. SUBJECT — the main subject exactly as this ad presents it (person / product / scene), specific\n"
             "  2. MATERIALS / TEXTURES — fabric, surface, finish (matte, glossy, brushed metal, condensation, etc.)\n"
-            "  3. COMPOSITION / FRAMING — camera angle, distance, crop, and a named lens + f-stop (e.g. 35mm f/1.8, shot on iPhone front camera)\n"
-            "  4. LIGHTING — source, quality, direction, and color temperature (e.g. soft window light, warm 3200K)\n"
-            "  5. STYLE — photographic/mood reference, aesthetic anchor\n"
+            "  3. COMPOSITION / FRAMING — camera angle, distance, crop; use a named lens + f-stop ONLY if it's a photographic ad\n"
+            "  4. LIGHTING — source, quality, direction, and color temperature (or the graphic lighting/glow if illustrated)\n"
+            "  5. STYLE — the aesthetic anchor of THIS ad (photoreal UGC, 3D render, surreal illustration, etc.)\n"
             "  6. BACKGROUND — setting, color, depth\n"
-            "  7. RESOLUTION / FORMAT — always vertical 9:16, high-res quality tag\n"
-            "SPECIFICITY: name exact lenses, f-stops, material finishes, and color temperatures — NEVER vague terms like 'nice lighting'.\n"
-            "REALISM: always include at least one deliberate imperfection / analog descriptor (film grain, authentic skin texture, slight asymmetry, natural blemish, condensation).\n"
-            "BRANDING: do NOT invent logos or on-image text — leave those for post-production.\n"
-            "The higgsfield_prompt is a still-to-video MOTION LAYER and must specify: WHAT MOVES (hair, fabric, subtle facial movement, hands/product, particles), WHAT STAYS STILL, CAMERA BEHAVIOR (locked / slow drift / handheld micro-shake), DURATION/quality of motion (gentle sway, single gesture), and ATMOSPHERE (breath, breeze, passing light). Goal is believable real front-camera phone footage with natural blinking — NOT cinematic perfection.\n"
+            "  7. RESOLUTION / FORMAT — vertical 9:16, high-res quality tag\n"
+            "SPECIFICITY: name exact finishes, colors, and (for photographic ads) lenses/color temps — NEVER vague terms like 'nice lighting'.\n"
+            "REALISM (photographic ads only): include a deliberate imperfection (film grain, authentic skin texture, slight asymmetry).\n"
+            "TEXT OVERLAYS: if the ad relies on bold on-image text, note where text would go as a placeholder region, but do NOT invent brand logos.\n"
+            "The higgsfield_prompt is a MOTION LAYER matched to the format: for UGC, natural talking/blinking + handheld drift; for a product/graphic ad, product glints, light flares, floating elements, subtle text shimmer, slow push-in. Specify WHAT MOVES, WHAT STAYS STILL, CAMERA BEHAVIOR, and ATMOSPHERE.\n"
             "============================================================\n\n"
         )
         + "Respond ONLY with valid JSON in this EXACT shape:\n"
@@ -2178,7 +2223,7 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
         '  "visual_style": "2-3 sentences: format (UGC/studio/lifestyle), framing, setting, wardrobe, lighting, color grade, and production quality",\n'
         '  "hook_type": "1-2 sentences describing the opening hook and persuasion angle",\n'
         '  "tone": "a few descriptive words",\n'
-        '  "flux_prompt": "A single richly detailed text-to-image prompt (80-120 words) for a FRESH original still matching this creative style, built strictly from the 7 house elements above IN ORDER (Subject, Materials/Textures, Composition/Framing with named lens + f-stop, Lighting with direction + color temp, Style, Background, then end with the 9:16 format + quality tag). Include at least one deliberate imperfection/analog descriptor. No brand names, logos, or on-image text.",\n'
+        '  "flux_prompt": "A single richly detailed text-to-image prompt (90-130 words) that REPLICATES this ad as closely as possible — same format, composition/layout, subject and pose, props, color palette/grade, lighting, and mood — built from the 7 house elements IN ORDER. Match the original tightly; only deviate to stay original (no copied logos/verbatim claims) and filter-safe (no nudity/explicit). For photographic ads include a named lens + color temp and one imperfection; for graphic/illustrated ads describe the render style and text-overlay regions. End with the 9:16 format + quality tag.",\n'
         '  "higgsfield_prompt": "A still-to-video motion prompt (50-80 words) following the house motion-layer rules: what moves, what stays still, camera behavior, motion duration/quality, and atmosphere — believable front-camera UGC phone footage with natural blinking."\n'
         "}\n\n"
         + FILTER_SAFE_RULES +
@@ -2403,56 +2448,90 @@ def analyze_beats():
     })
 
 
-# Flux model on fal.ai — overridable via env var (flux/dev, flux/schnell, flux-pro/v1.1)
-FAL_MODEL = os.environ.get("FAL_MODEL", "fal-ai/flux/dev")
+_HF_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+# Higgsfield text-to-image model — overridable via env var
+HIGGSFIELD_IMAGE_MODEL = os.environ.get("HIGGSFIELD_IMAGE_MODEL", "higgsfield-ai/soul/standard")
+
+def _hf_extract_image(resp):
+    """Pull an image URL out of a Higgsfield status/result response (several shapes)."""
+    imgs = resp.get("images")
+    if isinstance(imgs, list) and imgs:
+        first = imgs[0]
+        return first.get("url") if isinstance(first, dict) else first
+    out = resp.get("output")
+    if isinstance(out, dict):
+        return out.get("url") or out.get("image_url")
+    return None
 
 @app.route("/generate/image", methods=["POST"])
 def generate_image():
-    """Generate a 9:16 still with Flux via fal.ai (synchronous)."""
+    """Submit a 9:16 image job to Higgsfield (Soul). Returns request_id for polling."""
     data   = request.json or {}
     prompt = data.get("prompt", "")
-    fal_key = os.environ.get("FAL_API_KEY", "").strip()
-
-    if not fal_key:
-        return jsonify({
-            "status":    "placeholder",
-            "image_url": "https://placehold.co/720x1280/6366f1/white?text=Add+FAL_API_KEY",
-            "message":   "Placeholder — set FAL_API_KEY in Railway env vars to enable Flux",
-        })
+    auth = _higgsfield_auth()
+    if not auth:
+        return jsonify({"status": "error",
+                        "message": "Set HIGGSFIELD_API_KEY + HIGGSFIELD_API_SECRET in Railway env vars"}), 400
     if not prompt.strip():
         return jsonify({"status": "error", "message": "Empty prompt"}), 400
-
     try:
         payload = json.dumps({
-            "prompt":              prompt,
-            "image_size":          "portrait_16_9",   # vertical 9:16 per SOP
-            "num_images":          1,
-            "enable_safety_checker": False,
+            "prompt":       prompt,
+            "aspect_ratio": "9:16",
+            "resolution":   "1080p",
         }).encode()
         req = urllib.request.Request(
-            f"https://fal.run/{FAL_MODEL}",
+            f"https://platform.higgsfield.ai/{HIGGSFIELD_IMAGE_MODEL}",
             data=payload,
-            headers={
-                "Authorization": f"Key {fal_key}",
-                "Content-Type":  "application/json",
-            },
+            headers={"Authorization": auth, "Content-Type": "application/json",
+                     "Accept": "application/json", "User-Agent": _HF_UA},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
-        imgs = resp.get("images") or []
-        url  = imgs[0].get("url") if imgs and isinstance(imgs[0], dict) else None
-        if not url:
-            return jsonify({"status": "error", "image_url": None, "message": "No image returned"}), 502
-        return jsonify({"status": "completed", "image_url": url, "message": "Generated with Flux"})
+        # Some models return the image immediately; otherwise a request_id to poll
+        url = _hf_extract_image(resp)
+        if url:
+            return jsonify({"status": "completed", "image_url": url})
+        return jsonify({"status": resp.get("status", "queued"),
+                        "request_id": resp.get("request_id", "")})
     except urllib.error.HTTPError as e:
         try:    err = e.read().decode()[:250]
         except Exception: err = ""
-        print(f"[FLUX] HTTP {e.code}: {err}")
+        print(f"[HF IMAGE] HTTP {e.code}: {err}")
         return jsonify({"status": "error", "image_url": None, "message": f"HTTP {e.code}: {err}"}), 502
     except Exception as e:
-        print(f"[FLUX] error: {e}")
+        print(f"[HF IMAGE] error: {e}")
         return jsonify({"status": "error", "image_url": None, "message": str(e)}), 502
+
+@app.route("/generate/image/status", methods=["POST"])
+def generate_image_status():
+    """Poll Higgsfield for an image request. Returns image_url when completed."""
+    data = request.json or {}
+    rid  = data.get("request_id", "")
+    auth = _higgsfield_auth()
+    if not auth or not rid:
+        return jsonify({"status": "error", "message": "Missing request_id or credentials"}), 400
+    try:
+        req = urllib.request.Request(
+            f"https://platform.higgsfield.ai/requests/{rid}/status",
+            headers={"Authorization": auth, "Accept": "application/json", "User-Agent": _HF_UA},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+        status = resp.get("status", "")
+        url    = _hf_extract_image(resp)
+        if status in ("failed", "nsfw"):
+            print(f"[HF IMAGE FAIL] {rid[:8]} raw={json.dumps(resp)[:400]}")
+        return jsonify({"status": status, "image_url": url})
+    except urllib.error.HTTPError as e:
+        try:    err = e.read().decode()[:250]
+        except Exception: err = ""
+        return jsonify({"status": "error", "message": f"HTTP {e.code}: {err}"}), 502
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 502
 
 
 # Higgsfield image-to-video model — overridable via env var
