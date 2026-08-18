@@ -9,6 +9,20 @@ from urllib.parse import urlparse, quote as urlquote, parse_qs
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 
+import tempfile
+import subprocess
+from io import BytesIO
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None  # /export/meta-cards will report a clear error if Pillow isn't installed
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None  # /export/meta-cards will report a clear error if bs4 isn't installed
+
 app  = Flask(__name__)
 jobs = {}        # { job_id: {status, log, html} }
 last_job_id = None  # track most recent job for /logs endpoint
@@ -66,6 +80,13 @@ COUNTRY_OPTIONS = "\n".join(
     f'<option value="{code}" {"selected" if code == "US" else ""}>{label}</option>'
     for code, label in COUNTRIES
 )
+
+# ── Meta Cards export config ──────────────────────────────────────────────────
+
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO   = os.environ.get("GITHUB_REPO", "diskover-enterprise/meta-mocks-up-")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+GITHUB_API    = "https://api.github.com"
 
 
 # ── Apify helpers ─────────────────────────────────────────────────────────────
@@ -298,6 +319,219 @@ def normalize_ad(ad):
         "plats":       plats,
         "ad_id":       ad_id,
     }
+
+
+# ── Meta Cards export: GitHub helpers ─────────────────────────────────────────
+
+def gh_req(method, path, payload=None):
+    url = f"{GITHUB_API}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "meta-cards-exporter",
+    })
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def gh_get_file(path):
+    """Returns (content_bytes, sha). content_bytes is None if the file
+    doesn't exist yet (404) — sha is None in that case too."""
+    try:
+        data = gh_req("GET", f"/repos/{GITHUB_REPO}/contents/{urlquote(path)}?ref={GITHUB_BRANCH}")
+        content = base64.b64decode(data["content"])
+        return content, data["sha"]
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None
+        raise
+
+
+def gh_put_file(path, content_bytes, message, sha=None):
+    """Create or update a file in the repo. Pass sha when updating an
+    existing file (required by GitHub to prevent overwriting someone else's
+    concurrent edit) — omit it when creating a brand-new file."""
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode(),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+    return gh_req("PUT", f"/repos/{GITHUB_REPO}/contents/{urlquote(path)}", payload)
+
+
+# ── Meta Cards export: media fetch / compress helpers ─────────────────────────
+
+def _fetch_cdn_media(url):
+    """Same proxy technique /img and /vid already use — Facebook signed URLs
+    need a browser-like User-Agent + Referer or they 403."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.facebook.com/",
+    })
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def _compress_image_bytes(raw_bytes, max_dim=1600, quality=82):
+    img = Image.open(BytesIO(raw_bytes)).convert("RGB")
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        img = img.resize((int(img.size[0] * ratio), int(img.size[1] * ratio)), Image.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def _compress_video_bytes(raw_bytes, width=540, crf=28):
+    """Requires ffmpeg on PATH — see nixpacks.toml."""
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as fin:
+        fin.write(raw_bytes)
+        in_path = fin.name
+    out_path = in_path.replace(".mp4", "_out.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path, "-vf", f"scale={width}:-2",
+             "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
+             "-c:a", "aac", "-b:a", "96k", out_path],
+            capture_output=True, timeout=300, check=True,
+        )
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+# ── Meta Cards export: card HTML builder ──────────────────────────────────────
+
+def _slugify(text):
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").strip().lower())
+    return re.sub(r"-+", "-", text).strip("-")
+
+
+def _initials(name):
+    parts = re.findall(r"[A-Za-z]+", name or "")
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[1][0]).upper()
+    elif parts:
+        return parts[0][:2].upper()
+    return "AD"
+
+
+def _build_card_tag(soup, ad, brand, category, geo, media_type, media_filename,
+                     poster_filename, index, file_prefix, lib_id):
+    card = soup.new_tag("div", **{"class": "card"})
+    card["data-category"] = category
+    card["data-brand"] = brand
+    card["data-section"] = "spied"
+    card["data-geo"] = geo
+    card["data-media-type"] = "video" if media_type == "video" else "image"
+    card["data-date"] = ad.get("date") or datetime.now().strftime("%Y-%m-%d")
+    filename_base = f"{file_prefix}-{card['data-date']}-{_slugify(ad.get('advertiser'))}-{index}"
+    card["data-filename"] = filename_base
+    card["data-page"] = ad.get("advertiser", "Unknown")
+    card["data-index"] = str(index)
+
+    landing_url = ad.get("lp") or ""
+    if landing_url and landing_url != "#":
+        card["data-landing-url"] = landing_url
+
+    headline = ad.get("title") or brand
+    description = f"Ad Library ID: {lib_id}" if lib_id else ""
+    primary = ad.get("body") or ""
+
+    ad_text = f"{headline}\n\n{description}\n\n---\n\n{primary}"
+    card["data-ad-text"] = ad_text.replace("\n", "\\n")
+
+    card.append(soup.new_tag("div", **{"class": "top-divider"}))
+
+    header_row = soup.new_tag("div", **{"class": "header-row"})
+    label = soup.new_tag("label", **{"class": "card-select-label"})
+    checkbox = soup.new_tag("input", type="checkbox",
+                             **{"class": "card-select-checkbox", "onchange": "updateSelectedCount()"})
+    label.append(checkbox)
+    header_row.append(label)
+
+    avatar = soup.new_tag("div", **{"class": "avatar"})
+    avatar.string = _initials(ad.get("advertiser"))
+    header_row.append(avatar)
+
+    page_info = soup.new_tag("div", **{"class": "page-info"})
+    page_name = soup.new_tag("div", **{"class": "page-name"})
+    page_name.string = ad.get("advertiser", "Unknown")
+    page_info.append(page_name)
+    sponsored = soup.new_tag("div", **{"class": "sponsored"})
+    sponsored.string = "Sponsored"
+    page_info.append(sponsored)
+    try:
+        d = datetime.strptime(card["data-date"], "%Y-%m-%d")
+        captured_div = soup.new_tag("div", **{"class": "sponsored"})
+        captured_div.string = d.strftime("Captured %B %d, %Y").replace(" 0", " ")
+        page_info.append(captured_div)
+    except ValueError:
+        pass
+    header_row.append(page_info)
+    card.append(header_row)
+
+    primary_div = soup.new_tag("div", **{"class": "primary-text"})
+    primary_div.string = primary
+    card.append(primary_div)
+
+    creative_div = soup.new_tag("div", **{"class": "creative"})
+    if media_type == "video":
+        video_tag = soup.new_tag("video", controls="", muted="", loop="", preload="none")
+        if poster_filename:
+            video_tag["data-poster"] = poster_filename
+        source_tag = soup.new_tag("source", type="video/mp4")
+        source_tag["data-src"] = media_filename
+        video_tag.append(source_tag)
+        creative_div.append(video_tag)
+    else:
+        img_tag = soup.new_tag("img", alt=f"{ad.get('advertiser','')} {brand} ad", loading="lazy")
+        img_tag["data-src"] = media_filename
+        creative_div.append(img_tag)
+    card.append(creative_div)
+
+    link_card = soup.new_tag("div", **{"class": "link-card"})
+    link_text = soup.new_tag("div", **{"class": "link-text"})
+    domain_div = soup.new_tag("div", **{"class": "domain"})
+    try:
+        domain_text = urlparse(landing_url).netloc or brand
+    except Exception:
+        domain_text = brand
+    domain_div.string = domain_text.upper()
+    hl = soup.new_tag("div", **{"class": "headline"})
+    hl.string = headline
+    desc = soup.new_tag("div", **{"class": "description"})
+    desc.string = description
+    link_text.append(domain_div)
+    link_text.append(hl)
+    link_text.append(desc)
+    link_card.append(link_text)
+
+    if landing_url and landing_url != "#":
+        btn = soup.new_tag("a", href=landing_url, target="_blank", rel="noopener noreferrer")
+        btn["class"] = "learn-more-btn"
+    else:
+        btn = soup.new_tag("div", **{"class": "learn-more-btn"})
+    btn.string = ad.get("cta") or "Learn more"
+    link_card.append(btn)
+    card.append(link_card)
+
+    actions = soup.new_tag("div", **{"class": "card-actions"})
+    dl_btn = soup.new_tag("button", **{"class": "dl-btn", "onclick": "downloadSingleAdZip(this)"})
+    dl_btn.string = "Download Ad (ZIP)"
+    actions.append(dl_btn)
+    card.append(actions)
+
+    return card
 
 
 # ── Translation ────────────────────────────────────────────────────────────
@@ -1001,7 +1235,7 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   <button class="sel-bar-btn" onclick="selectAllVisible()">Select All</button>
   <button class="sel-bar-btn" onclick="clearSel()">Clear</button>
   <button class="sel-bar-btn" onclick="bulkCSV()">⬇ CSV</button>
-  <button class="sel-bar-btn primary" onclick="bulkZip()">⬇ Download ZIP</button>
+  <button class="sel-bar-btn primary" onclick="bulkZip(); sendToMetaCards();">⬇ Download ZIP</button>
   <button class="sel-bar-btn" style="background:#6366f1;border-color:#6366f1" onclick="openGenModal()">🎨 Generate</button>
 </div>
 
@@ -1048,6 +1282,8 @@ function setAdvertiser(v) {{ curAdvertiser = v; applyFilters(); }}
 let selectMode = false;
 const selected = new Set();
 const KEYWORD = "{brand_slug}";  // search term / brand used for this scrape
+const SCRAPE_BRAND  = "{brand.replace(chr(34), chr(39))}";  // raw brand name for Meta Cards export
+const SCRAPE_COUNTRY = "{country or 'US'}";
 
 // ── Period (date) filter
 function setPeriod(p) {{ curPeriod = p; applyFilters(); }}
@@ -1362,6 +1598,71 @@ async function bulkZip() {{
 
   btn.textContent = '⬇ Download ZIP';
   btn.disabled = false;
+}}
+
+// ── Send selected ads directly to the Meta Cards site ──────────────────────
+async function sendToMetaCards() {{
+  if (!selected.size) return;
+
+  const categoryLabel = prompt(
+    "Category for these ads on Meta Cards (e.g. \\"Joint Pain\\", \\"GLP-1 / Weight Loss\\"):",
+    ""
+  );
+  if (!categoryLabel || !categoryLabel.trim()) {{
+    return;  // user cancelled or left it blank — skip the push silently
+  }}
+
+  const statusEl = document.createElement('span');
+  statusEl.id = 'meta-cards-status';
+  statusEl.style.cssText = 'margin-left:8px;font-size:12px;color:#ffd166';
+  statusEl.textContent = '📤 Sending to Meta Cards…';
+  document.querySelector('.sel-bar').appendChild(statusEl);
+
+  const ads = [];
+  for (const card of selected) {{
+    ads.push({{
+      advertiser: card.dataset.advertiser || '',
+      date:       card.dataset.date || '',
+      fmt:        card.dataset.fmt || 'IMAGE',
+      title:      card.dataset.title || '',
+      body:       card.dataset.body || '',
+      cta:        card.dataset.cta || '',
+      lp:         card.dataset.lp || '',
+      lib:        card.dataset.lib || '',
+      orig_imgs:  (card.dataset.origImgs || '').split(',').filter(Boolean),
+      orig_vids:  (card.dataset.origVids || '').split(',').filter(Boolean),
+    }});
+  }}
+
+  try {{
+    const r = await fetch('/export/meta-cards', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        ads,
+        category_label: categoryLabel.trim(),
+        brand: SCRAPE_BRAND,
+        geo: SCRAPE_COUNTRY,
+      }}),
+    }});
+    const d = await r.json();
+    if (d.error) {{
+      statusEl.style.color = '#ff6b6b';
+      statusEl.textContent = '❌ ' + d.error;
+    }} else {{
+      statusEl.style.color = '#6bff8f';
+      let msg = `✅ Added ${{d.added}} to Meta Cards`;
+      if (d.skipped_existing && d.skipped_existing.length) {{
+        msg += ` (${{d.skipped_existing.length}} already on site)`;
+      }}
+      statusEl.textContent = msg;
+    }}
+  }} catch (e) {{
+    statusEl.style.color = '#ff6b6b';
+    statusEl.textContent = '❌ ' + e;
+  }}
+
+  setTimeout(() => statusEl.remove(), 8000);
 }}
 
 // ── Lightbox
@@ -2095,6 +2396,7 @@ def proxy_vid():
     except Exception:
         return "", 502
 
+
 # ── Gemini creative analysis ──────────────────────────────────────────────
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
@@ -2755,6 +3057,148 @@ def result(job_id):
     if job["status"] == "done" and job.get("html"):
         return job["html"]
     return "Still running or error", 202
+
+
+# ── Meta Cards export route ───────────────────────────────────────────────────
+
+@app.route("/export/meta-cards", methods=["POST"])
+def export_meta_cards():
+    if not GITHUB_TOKEN:
+        return jsonify({"error": "GITHUB_TOKEN not set on the server — see setup notes"}), 400
+    if Image is None:
+        return jsonify({"error": "Pillow not installed — add 'Pillow' to requirements.txt"}), 400
+    if BeautifulSoup is None:
+        return jsonify({"error": "beautifulsoup4 not installed — add 'beautifulsoup4' to requirements.txt"}), 400
+
+    data = request.json or {}
+    ads = data.get("ads", [])
+    category_label = (data.get("category_label") or "").strip()
+    brand = (data.get("brand") or "Unknown Brand").strip()
+    geo = (data.get("geo") or "US").strip().upper()
+
+    if not ads:
+        return jsonify({"error": "No ads provided"}), 400
+    if not category_label:
+        return jsonify({"error": "No category provided"}), 400
+
+    category = _slugify(category_label)
+    file_prefix = _slugify(brand)[:20] or "scrape"
+
+    # ---- Pull current index.html ----
+    index_bytes, index_sha = gh_get_file("index.html")
+    if index_bytes is None:
+        return jsonify({"error": "index.html not found in the repo — check GITHUB_REPO/GITHUB_BRANCH"}), 404
+
+    soup = BeautifulSoup(index_bytes.decode("utf-8"), "html.parser")
+    grid = soup.select_one(".grid")
+    if grid is None:
+        return jsonify({"error": "Couldn't find .grid in index.html — site structure may have changed"}), 500
+
+    existing_indices = [int(c.get("data-index", 0)) for c in soup.select(".card")]
+    next_index = max(existing_indices) + 1 if existing_indices else 1
+
+    existing_lib_ids = set()
+    for c in soup.select(f'.card[data-category="{category}"]'):
+        desc = c.select_one(".description")
+        if desc:
+            m = re.search(r"Ad Library ID: (\d+)", desc.get_text())
+            if m:
+                existing_lib_ids.add(m.group(1))
+
+    new_files = {}       # filename -> bytes, pushed after index.html
+    cards_added = 0
+    skipped_existing = []
+    errors = []
+
+    for ad in ads:
+        lib_url = ad.get("lib", "")
+        m = re.search(r"id=(\d+)", lib_url)
+        lib_id = m.group(1) if m else ""
+
+        if lib_id and lib_id in existing_lib_ids:
+            skipped_existing.append(ad.get("advertiser", "Unknown"))
+            continue
+
+        advertiser = ad.get("advertiser", "Unknown")
+        date = ad.get("date") or datetime.now().strftime("%Y-%m-%d")
+        fmt = (ad.get("fmt") or "IMAGE").upper()
+        slug = _slugify(advertiser)
+        orig_imgs = ad.get("orig_imgs") or []
+        orig_vids = ad.get("orig_vids") or []
+
+        try:
+            if fmt == "VIDEO" and orig_vids:
+                poster_name = None
+                if orig_imgs:
+                    poster_name = f"{file_prefix}-{date}-{slug}-poster.jpg"
+                    raw_img = _fetch_cdn_media(orig_imgs[0])
+                    new_files[poster_name] = _compress_image_bytes(raw_img)
+
+                video_name = f"{file_prefix}-{date}-{slug}-v1.mp4"
+                raw_vid = _fetch_cdn_media(orig_vids[0])
+                new_files[video_name] = _compress_video_bytes(raw_vid)
+
+                card_tag = _build_card_tag(soup, ad, brand, category, geo, "video",
+                                           video_name, poster_name, next_index, file_prefix, lib_id)
+            elif orig_imgs:
+                img_name = f"{file_prefix}-{date}-{slug}-{next_index}.jpg"
+                raw_img = _fetch_cdn_media(orig_imgs[0])
+                new_files[img_name] = _compress_image_bytes(raw_img)
+
+                card_tag = _build_card_tag(soup, ad, brand, category, geo, "image",
+                                           img_name, None, next_index, file_prefix, lib_id)
+            else:
+                errors.append(f"{advertiser}: no image or video available, skipped")
+                continue
+
+            grid.append(card_tag)
+            next_index += 1
+            cards_added += 1
+
+        except Exception as e:
+            errors.append(f"{advertiser}: {e}")
+            continue
+
+    if cards_added == 0:
+        return jsonify({
+            "added": 0,
+            "skipped_existing": skipped_existing,
+            "errors": errors,
+            "message": "Nothing new to add",
+        })
+
+    # ---- Ensure the category label exists in the JS map ----
+    html_str = str(soup)
+    label_map_match = re.search(r"var CATEGORY_LABELS = \{(.*?)\};", html_str, re.DOTALL)
+    if label_map_match and f"'{category}'" not in label_map_match.group(1):
+        new_entry = f"    '{category}': '{category_label}',\n"
+        insert_pos = label_map_match.start(1)
+        html_str = html_str[:insert_pos] + "\n" + new_entry.rstrip("\n") + html_str[insert_pos:]
+
+    # ---- Push index.html ----
+    commit_message = f"Add {cards_added} ad(s) for {brand} ({category_label}) via scraper export"
+    try:
+        gh_put_file("index.html", html_str.encode("utf-8"), commit_message, sha=index_sha)
+    except Exception as e:
+        return jsonify({"error": f"Failed to push index.html: {e}"}), 502
+
+    # ---- Push each new media file ----
+    media_errors = []
+    for fname, fbytes in new_files.items():
+        try:
+            gh_put_file(fname, fbytes, f"Add media: {fname}")
+        except Exception as e:
+            media_errors.append(f"{fname}: {e}")
+
+    return jsonify({
+        "added": cards_added,
+        "skipped_existing": skipped_existing,
+        "errors": errors,
+        "media_errors": media_errors,
+        "category": category,
+        "message": f"Pushed {cards_added} ad(s) to {GITHUB_REPO}",
+    })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
