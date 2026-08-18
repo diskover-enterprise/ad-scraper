@@ -952,6 +952,9 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
   <button class="fbtn" id="gbtn" onclick="toggleGroup(this)">⊞ Group</button>
   <button class="fbtn" id="selbtn" onclick="toggleSelectMode(this)">☐ Select</button>
   <input id="srch" class="search-box" placeholder="Search advertiser or copy…" oninput="applyFilters()">
+  <select class="sort-sel" id="adv-sel" onchange="setAdvertiser(this.value)">
+    <option value="">📄 All pages</option>
+  </select>
   <select class="sort-sel" id="period-sel" onchange="setPeriod(this.value)">
     <option value="all">📅 All dates</option>
     <option value="w0">This week</option>
@@ -1023,6 +1026,25 @@ header{{background:{C};color:white;padding:16px 24px;display:flex;justify-conten
 // ── State
 let curFilter = 'all', curView = 'card';
 let curPeriod = 'all';
+let curAdvertiser = '';
+
+// ── Advertiser / page filter
+function setAdvertiser(v) {{ curAdvertiser = v; applyFilters(); }}
+
+// Populate the advertiser dropdown from the cards present
+(function populateAdvertisers() {{
+  const names = new Set();
+  document.querySelectorAll('.card').forEach(c => {{
+    const a = (c.dataset.advertiser || '').trim();
+    if (a) names.add(a);
+  }});
+  const sel = document.getElementById('adv-sel');
+  [...names].sort((a, b) => a.localeCompare(b)).forEach(name => {{
+    const o = document.createElement('option');
+    o.value = name; o.textContent = name;
+    sel.appendChild(o);
+  }});
+}})();
 let selectMode = false;
 const selected = new Set();
 const KEYWORD = "{brand_slug}";  // search term / brand used for this scrape
@@ -1075,15 +1097,16 @@ function setView(v) {{
 function applyFilters() {{
   const q = (document.getElementById('srch').value || '').toLowerCase();
   let n = 0;
+  const matchAdv = (el) => !curAdvertiser || (el.dataset.advertiser || '') === curAdvertiser;
   if (curView === 'card') {{
     document.querySelectorAll('.card').forEach(c => {{
-      const show = matchF(c) && matchPeriod(c) && (!q || [c.dataset.advertiser, c.dataset.body, c.dataset.title].some(s => (s||'').toLowerCase().includes(q)));
+      const show = matchF(c) && matchPeriod(c) && matchAdv(c) && (!q || [c.dataset.advertiser, c.dataset.body, c.dataset.title].some(s => (s||'').toLowerCase().includes(q)));
       c.style.display = show ? '' : 'none';
       if (show) n++;
     }});
   }} else {{
     document.querySelectorAll('#tbody tr').forEach(r => {{
-      const show = matchF(r) && matchPeriod(r) && (!q || r.textContent.toLowerCase().includes(q));
+      const show = matchF(r) && matchPeriod(r) && matchAdv(r) && (!q || r.textContent.toLowerCase().includes(q));
       r.style.display = show ? '' : 'none';
       if (show) n++;
     }});
