@@ -493,7 +493,7 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
 
 # ── Scrape worker ─────────────────────────────────────────────────────────────
 
-def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, cookies=None):
+def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, cookies=None, per_page=0):
     job = jobs[job_id]
     def log(msg): job["log"].append(msg)
 
@@ -567,6 +567,22 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
             if aid not in seen:
                 seen.add(aid)
                 unique.append(ad)
+
+        # Discovery mode: cap ads per advertiser (keep the highest-impression / newest)
+        if per_page and per_page > 0:
+            def _rank(ad):
+                n = normalize_ad(ad)
+                return (n.get("imp_idx", -1), n.get("date", ""))
+            by_adv = {}
+            for ad in unique:
+                name = normalize_ad(ad)["name"]
+                by_adv.setdefault(name, []).append(ad)
+            capped = []
+            for name, ads_list in by_adv.items():
+                ads_list.sort(key=_rank, reverse=True)
+                capped.extend(ads_list[:per_page])
+            log(f"🔎 Discovery mode: {len(by_adv)} pages, capped to {per_page} ads each → {len(capped)} ads (from {len(unique)})")
+            unique = capped
 
         log(f"📊 {len(unique)} unique ads")
         # DEBUG: dump snapshot structure of the first ad with no extractable creative
@@ -1810,6 +1826,14 @@ input:focus,select:focus{border-color:#1877f2;box-shadow:0 0 0 3px rgba(24,119,2
       </div>
     </div>
 
+    <label style="margin-top:16px">Ads per page <span style="font-weight:normal;color:#aaa">(discovery mode — see more advertisers, fewer ads each)</span></label>
+    <select name="per_page">
+      <option value="0">All ads per page</option>
+      <option value="3">Max 3 per page (discover)</option>
+      <option value="5">Max 5 per page</option>
+      <option value="10">Max 10 per page</option>
+    </select>
+
     <div class="divider">
       <label>Keywords / Search Terms <span style="font-weight:normal;color:#aaa">(one search per line — paste as many as you want)</span></label>
       <textarea name="keywords_bulk" placeholder="weight loss&#10;fat burner&#10;glp1&#10;semaglutide"
@@ -1965,6 +1989,8 @@ def home():
 def start():
     country   = request.form.get("country", "US")
     ad_status = request.form.get("ad_status", "active")
+    try:    per_page = int(request.form.get("per_page", "0"))
+    except: per_page = 0
 
     def split_lines(field):
         return [ln.strip() for ln in request.form.get(field, "").splitlines() if ln.strip()]
@@ -2015,7 +2041,7 @@ def start():
     threading.Thread(
         target=run_job,
         args=(job_id, brand, country, searches, domains, page_urls, ad_status),
-        kwargs={"cookies": cookies},
+        kwargs={"cookies": cookies, "per_page": per_page},
         daemon=True
     ).start()
 
