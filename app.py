@@ -258,6 +258,13 @@ def normalize_ad(ad):
     ad_id   = str(ad.get("ad_archive_id") or ad.get("ad_id") or "")
     lib_url = ad.get("ad_library_url") or (f"https://www.facebook.com/ads/library/?id={ad_id}" if ad_id else "#")
 
+    # Page ID — unique per advertiser account (disambiguates same-name pages)
+    page_id = str(ad.get("page_id") or snap.get("page_id") or "")
+    page_ads_url = (
+        f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all"
+        f"&country=ALL&view_all_page_id={page_id}&search_type=page&media_type=all"
+    ) if page_id else ""
+
     # Impressions index → human range
     impressions = ""
     imp_idx = -1
@@ -297,6 +304,8 @@ def normalize_ad(ad):
         "variants":    int(variants),
         "plats":       plats,
         "ad_id":       ad_id,
+        "page_id":     page_id,
+        "page_ads_url": page_ads_url,
     }
 
 
@@ -707,11 +716,14 @@ def build_viewer(brand, country, ads):
             f' data-advertiser="{adv_slug}" data-body="{body_slug}" data-title="{ttl_slug}"'
             f' data-date="{n["date"]}" data-imp="{n["imp_idx"]}" data-cta="{cta}" data-lp="{lp_slug}" data-lib="{lib_slug}"'
             f' data-imgs="{imgs_attr}" data-vids="{vids_attr}"'
-            f' data-orig-imgs="{orig_imgs_attr}" data-orig-vids="{orig_vids_attr}">'
+            f' data-orig-imgs="{orig_imgs_attr}" data-orig-vids="{orig_vids_attr}"'
+            f' data-pageid="{n["page_id"]}">'
             f'<label class="card-cb-wrap" onclick="event.stopPropagation()"><input type="checkbox" class="card-cb" onchange="toggleSelect(this)"></label>'
             f'<div class="card-header">'
-            f'<div class="card-name">{n["name"]}</div>'
-            f'<div class="card-meta">{n["date"]} · {n["plats"]}</div>'
+            f'<div class="card-name">{n["name"]}'
+            f'{f" <span style=\"font-size:10px;color:#aaa;font-weight:normal\">#{n['page_id'][-6:]}</span>" if n["page_id"] else ""}</div>'
+            f'<div class="card-meta">{n["date"]} · {n["plats"]}'
+            f'{f" · <a href=\"{n['page_ads_url']}\" target=\"_blank\" style=\"color:#1877f2;text-decoration:none\">all ads from this page ↗</a>" if n["page_ads_url"] else ""}</div>'
             f'<div class="badge-row">'
             f'<span class="badge {st_cls}">{n["status"]}</span>'
             f'<span class="badge fmt">{fmt}</span>'
@@ -1047,17 +1059,26 @@ let curAdvertiser = '';
 // ── Advertiser / page filter
 function setAdvertiser(v) {{ curAdvertiser = v; applyFilters(); }}
 
-// Populate the advertiser dropdown from the cards present
+// Populate the advertiser dropdown — keyed by PAGE ID so same-name pages stay separate
 (function populateAdvertisers() {{
-  const names = new Set();
+  const pages = {{}};  // pageKey -> {{ name, id, count }}
   document.querySelectorAll('.card').forEach(c => {{
-    const a = (c.dataset.advertiser || '').trim();
-    if (a) names.add(a);
+    const name = (c.dataset.advertiser || 'Unknown').trim();
+    const id   = (c.dataset.pageid || '').trim();
+    const key  = id || name;
+    if (!pages[key]) pages[key] = {{ name, id, count: 0 }};
+    pages[key].count++;
   }});
+  // Detect names shared by more than one page ID
+  const nameCounts = {{}};
+  Object.values(pages).forEach(p => {{ nameCounts[p.name] = (nameCounts[p.name] || 0) + 1; }});
   const sel = document.getElementById('adv-sel');
-  [...names].sort((a, b) => a.localeCompare(b)).forEach(name => {{
+  Object.entries(pages).sort((a, b) => a[1].name.localeCompare(b[1].name)).forEach(([key, p]) => {{
     const o = document.createElement('option');
-    o.value = name; o.textContent = name;
+    o.value = key;
+    // Show ID suffix when the name is shared by multiple accounts
+    const suffix = (nameCounts[p.name] > 1 && p.id) ? ` (#${{p.id.slice(-6)}})` : '';
+    o.textContent = `${{p.name}}${{suffix}} — ${{p.count}}`;
     sel.appendChild(o);
   }});
 }})();
@@ -1113,7 +1134,7 @@ function setView(v) {{
 function applyFilters() {{
   const q = (document.getElementById('srch').value || '').toLowerCase();
   let n = 0;
-  const matchAdv = (el) => !curAdvertiser || (el.dataset.advertiser || '') === curAdvertiser;
+  const matchAdv = (el) => !curAdvertiser || ((el.dataset.pageid || el.dataset.advertiser || '') === curAdvertiser);
   if (curView === 'card') {{
     document.querySelectorAll('.card').forEach(c => {{
       const show = matchF(c) && matchPeriod(c) && matchAdv(c) && (!q || [c.dataset.advertiser, c.dataset.body, c.dataset.title].some(s => (s||'').toLowerCase().includes(q)));
