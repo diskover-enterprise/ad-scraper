@@ -39,7 +39,29 @@ def clear_locked_cookies():
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 META_ACTOR  = "XtaWFhbtfxyzqrFmd"   # curious_coder/facebook-ads-library-scraper (unauthenticated)
-AUTH_ACTOR  = os.environ.get("AUTH_ACTOR_ID", "")  # your custom meta-ads-auth-scraper actor ID
+AUTH_ACTOR  = os.environ.get("AUTH_ACTOR_ID", "big_wave~meta-ads-auth-scraper")  # your custom meta-ads-auth-scraper actor ID; falls back to the production default when absent
+
+
+def parse_auth_actor_count(raw, default=100, lo=1, hi=100):
+    """Parse AUTH_ACTOR_COUNT from the environment.
+
+    Anything that isn't a plain integer within [lo, hi] falls back to
+    `default` rather than being forwarded to the actor -- the validated
+    test actor (IUTRYPRMFxeXlfjII) has only been exercised up to 100
+    items per run, so out-of-range or malformed values are not trusted.
+    """
+    if raw is None:
+        return default
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if val < lo or val > hi:
+        return default
+    return val
+
+
+AUTH_ACTOR_COUNT = parse_auth_actor_count(os.environ.get("AUTH_ACTOR_COUNT"))  # validated range 1-100, default 100
 APIFY_BASE  = "https://api.apify.com/v2"
 
 COUNTRIES = [
@@ -91,6 +113,22 @@ def api_get(path):
     return apify_req("GET", path)
 
 def wait_for_run(run_id, log, poll=5, timeout=300):
+    """Poll an Apify run to completion and fetch its dataset items.
+
+    Returns (ads, run_meta) where run_meta = {"status": ..., "status_message": ...,
+    "telemetry": ...} taken straight from the Apify run record (plus, when
+    available, the actor's own AUTH_TELEMETRY record from its default
+    key-value store). Callers must check run_meta["status"] themselves -- a
+    FAILED/ABORTED/TIMED-OUT run can still have a (usually empty or partial)
+    dataset, and treating that dataset as a normal successful result is
+    exactly how a login redirect or checkpoint inside the actor gets silently
+    reported as "it worked, 0 ads found" instead of a real failure.
+
+    Telemetry retrieval is best-effort: a failure to fetch or parse it is
+    logged as a sanitized warning and never raised, so it cannot turn an
+    otherwise successful scrape into a failed one -- callers fall back to
+    the existing status/message classifier when run_meta["telemetry"] is None.
+    """
     deadline = time.time() + timeout
     r = {}
     while time.time() < deadline:
@@ -99,16 +137,274 @@ def wait_for_run(run_id, log, poll=5, timeout=300):
         if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
             break
         time.sleep(poll)
-    ds_id = r["data"]["defaultDatasetId"]
-    raw = api_get(f"datasets/{ds_id}/items?limit=200")
-    # Apify may return items as a raw list OR wrapped in {"data": {"items": [...]}}
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        if "data" in raw:
-            return raw["data"].get("items", [])
-        return raw.get("items", [])
+    run_data = r.get("data", {}) or {}
+    run_meta = {
+        "status":         run_data.get("status"),
+        "status_message": run_data.get("statusMessage"),
+        "telemetry":      None,
+    }
+    ds_id = run_data.get("defaultDatasetId")
+    ads = []
+    if ds_id:
+        raw = api_get(f"datasets/{ds_id}/items?limit=200")
+        # Apify may return items as a raw list OR wrapped in {"data": {"items": [...]}}
+        if isinstance(raw, list):
+            ads = raw
+        elif isinstance(raw, dict):
+            if "data" in raw:
+                ads = raw["data"].get("items", [])
+            else:
+                ads = raw.get("items", [])
+
+    kv_id = run_data.get("defaultKeyValueStoreId")
+    if kv_id:
+        try:
+            raw_telemetry = api_get(f"key-value-stores/{kv_id}/records/AUTH_TELEMETRY")
+            # The actor emits AUTH_TELEMETRY as a JSON array (one entry per
+            # searched URL) but a bare object is also accepted defensively
+            # -- classify_auth_state normalizes either shape.
+            run_meta["telemetry"] = raw_telemetry if isinstance(raw_telemetry, (dict, list)) else None
+        except Exception as e:
+            # Sanitized on purpose: never echo the raw exception (it can
+            # embed response bodies) -- just the exception type, which is
+            # enough to debug from logs without risking a token/cookie leak.
+            log(f"  ⚠️ Could not retrieve auth telemetry ({type(e).__name__}) — falling back to status-based classification")
+
+    return ads, run_meta
+
+
+# ── Authentication / session state classification ───────────────────────────
+#
+# This layer never talks to Facebook directly -- authentication, the GraphQL
+# requests, and pagination all happen inside the separate Apify actor
+# (AUTH_ACTOR_ID). From here we can only reason about two things: whether
+# cookies were supplied at all, and the Apify run's own reported status /
+# status message plus whatever ads it actually returned. Where the actor
+# gives no usable signal we report "unknown" rather than guessing -- this
+# function must never claim a state (especially session_valid=True) that it
+# cannot actually support, which is the bug being fixed here (previously the
+# app displayed "Authenticated mode" the instant cookies were present, with
+# no regard for whether the session behind them was still good).
+AUTH_FAILURE_SIGNATURES = {
+    "checkpoint_required": ("checkpoint", "suspicious activity", "verify your identity", "confirm it's you"),
+    "session_expired":     ("login", "log in", "logged out", "not logged in", "session expired", "redirect"),
+    "csrf_tokens_missing": ("fb_dtsg", "lsd token", "csrf"),
+}
+
+
+# Conservative status precedence used by both classify_auth_state and
+# combine_auth_states: whichever of these appears first in this tuple for a
+# given classification is reported as the overall `status`, most-concerning
+# first. "verified" is only ever reached once every more-concerning signal
+# has been ruled out.
+AUTH_STATUS_PRECEDENCE = (
+    "checkpoint_required",
+    "session_expired",      # covers both an outright expiry and a login-wall redirect
+    "no_cookies_provided",
+    "unverified",
+    "verified",
+)
+
+
+def _normalize_telemetry_entries(telemetry):
+    """Normalize AUTH_TELEMETRY into a list of per-URL entry dicts.
+
+    The real actor (meta-ads-auth-scraper, src/main.js) always calls
+    `Actor.setValue('AUTH_TELEMETRY', authTelemetry)` with `authTelemetry`
+    an ARRAY built by `authTelemetry.push({ url, country, ...authState })`
+    once per searched URL, where `authState` comes from
+    `classifyAuthentication()` (src/lib.js) and has exactly these fields:
+    cookies_provided (bool), auth_status (one of "no_cookies_provided",
+    "checkpoint_required", "session_expired", "unverified", "verified"),
+    checkpoint_detected (bool), login_wall_detected (bool).
+
+    A bare object (a single entry, not wrapped in a list) is also accepted
+    defensively in case a future single-URL run ever emits one directly.
+
+    Returns None only when telemetry itself is unavailable (the wait_for_run
+    caller never fetched/found a record). Any other shape -- including an
+    empty list or a value that is neither a dict nor a list -- means
+    telemetry IS present but unusable, which must never fall back to the
+    legacy ads-returned heuristic (see classify_auth_state below).
+    """
+    if telemetry is None:
+        return None
+    if isinstance(telemetry, dict):
+        return [telemetry]
+    if isinstance(telemetry, list):
+        return telemetry
     return []
+
+
+def _classify_telemetry_entry(entry):
+    """Classify one AUTH_TELEMETRY entry into one of the five named
+    statuses, using the required precedence: checkpoint > login-wall /
+    session-expired > no-cookies > unverified > verified. A field's boolean
+    signal (checkpoint_detected / login_wall_detected / cookies_provided)
+    takes priority over auth_status so a self-contradictory entry (e.g.
+    auth_status "verified" alongside checkpoint_detected true) is never
+    reported as verified -- requirement 6 forbids trusting a nonexistent
+    `verified: true` field, and this is the conservative reading of
+    `auth_status: "verified"` itself: only trustworthy when nothing else in
+    the same entry disagrees with it.
+    """
+    if not isinstance(entry, dict):
+        return "unverified"
+
+    auth_status         = entry.get("auth_status")
+    checkpoint_detected = entry.get("checkpoint_detected")
+    login_wall_detected = entry.get("login_wall_detected")
+    cookies_provided     = entry.get("cookies_provided")
+
+    if checkpoint_detected is True or auth_status == "checkpoint_required":
+        return "checkpoint_required"
+    if login_wall_detected is True or auth_status in ("session_expired", "logged_out"):
+        return "session_expired"
+    if cookies_provided is False or auth_status == "no_cookies_provided":
+        return "no_cookies_provided"
+    if auth_status == "unverified":
+        return "unverified"
+    if auth_status == "verified":
+        return "verified"
+    # Unrecognized/missing auth_status and no boolean signal fired --
+    # malformed data, conservatively unverified rather than guessed.
+    return "unverified"
+
+
+def classify_auth_state(cookies_present, run_status, run_status_message, ads, telemetry=None):
+    """Best-effort session-state classification for one authenticated-actor run.
+
+    Returns a dict with the five states Phase 2 requires, reported
+    separately: cookies_stored, session_valid, session_expired,
+    checkpoint_required, csrf_tokens_missing. session_valid may be True,
+    False, or the string "unknown" when this layer genuinely cannot tell.
+
+    Also reports `status`, a single conservative summary value following
+    AUTH_STATUS_PRECEDENCE. `telemetry`, when provided, is the actor's own
+    AUTH_TELEMETRY record (see wait_for_run / _normalize_telemetry_entries)
+    -- either a single object or an array of per-URL entries -- and is
+    authoritative over the run status-message heuristics below: once
+    telemetry is present at all, ads merely being present is never
+    sufficient on its own to report "verified", and a malformed/unusable
+    telemetry payload is reported "unverified" rather than silently falling
+    back to the legacy ads-returned heuristic.
+    """
+    state = {
+        "cookies_stored":      bool(cookies_present),
+        "session_valid":       "unknown",
+        "session_expired":     False,
+        "checkpoint_required": False,
+        "csrf_tokens_missing": False,
+        "status":              "unverified",
+    }
+
+    if not cookies_present:
+        # No cookies were ever presented -- there is no session to evaluate.
+        state["session_valid"] = False
+        state["status"] = "no_cookies_provided"
+        return state
+
+    entries = _normalize_telemetry_entries(telemetry)
+
+    if entries is not None:
+        # Telemetry is present (object or array) -- authoritative over the
+        # status-message heuristics and the legacy ads-returned fallback.
+        # Multiple per-URL entries combine via the same conservative
+        # precedence used across the whole job: the most-concerning status
+        # among them wins.
+        entry_statuses = [_classify_telemetry_entry(e) for e in entries] or ["unverified"]
+        telemetry_status = next(
+            (st for st in AUTH_STATUS_PRECEDENCE if st in entry_statuses),
+            "unverified",
+        )
+        if telemetry_status == "checkpoint_required":
+            state["checkpoint_required"] = True
+            state["session_valid"] = False
+        elif telemetry_status == "session_expired":
+            state["session_expired"] = True
+            state["session_valid"] = False
+        elif telemetry_status == "no_cookies_provided":
+            state["session_valid"] = False
+        elif telemetry_status == "verified":
+            state["session_valid"] = True
+        state["status"] = telemetry_status
+        return state
+
+    # No telemetry was available at all -- fall back to the status-message
+    # heuristics below, then (if those found nothing) the legacy
+    # ads-returned signal.
+    haystack = (run_status_message or "").lower()
+    for key, signatures in AUTH_FAILURE_SIGNATURES.items():
+        if any(sig in haystack for sig in signatures):
+            state[key] = True
+
+    if state["checkpoint_required"]:
+        state["session_valid"] = False
+        state["status"] = "checkpoint_required"
+        return state
+
+    if state["session_expired"]:
+        state["session_valid"] = False
+        state["status"] = "session_expired"
+        return state
+
+    if state["csrf_tokens_missing"]:
+        # Not one of the five named statuses -- surfaced via the
+        # csrf_tokens_missing flag, summarized conservatively as unverified.
+        state["session_valid"] = False
+        state["status"] = "unverified"
+        return state
+
+    if run_status and run_status != "SUCCEEDED":
+        # The actor run itself did not finish cleanly and its status message
+        # (if any) didn't match a recognizable Facebook-side signature above.
+        # This is still a real failure -- just one we can't further classify
+        # from here.
+        state["session_valid"] = False
+        state["status"] = "unverified"
+        return state
+
+    if not ads:
+        # The run "succeeded" but returned nothing. That is not proof the
+        # session actually unlocked authenticated content, so this stays
+        # unknown rather than being reported as valid.
+        state["status"] = "unverified"
+        return state
+
+    # No telemetry was available, so this falls back to the pre-existing
+    # heuristic: a clean run with cookies supplied that actually returned
+    # ads is the closest positive signal available at this layer. It is
+    # still not a GraphQL-level confirmation (that lives inside the actor).
+    state["session_valid"] = True
+    state["status"] = "verified"
+    return state
+
+
+def combine_auth_states(states):
+    """Merge the per-search auth states from one job into a single summary."""
+    if not states:
+        return classify_auth_state(False, None, None, [])
+    combined = {
+        "cookies_stored":      any(s.get("cookies_stored") for s in states),
+        "session_expired":     any(s.get("session_expired") for s in states),
+        "checkpoint_required": any(s.get("checkpoint_required") for s in states),
+        "csrf_tokens_missing": any(s.get("csrf_tokens_missing") for s in states),
+    }
+    values = [s.get("session_valid") for s in states]
+    if any(v is True for v in values):
+        combined["session_valid"] = True
+    elif any(v == "unknown" for v in values):
+        combined["session_valid"] = "unknown"
+    else:
+        combined["session_valid"] = False
+
+    # Conservative overall status: whichever named status appears among the
+    # per-search results that sorts earliest (most concerning) in
+    # AUTH_STATUS_PRECEDENCE wins, e.g. one search hitting a checkpoint marks
+    # the whole job checkpoint_required even if another search looked clean.
+    statuses = {s.get("status") for s in states if s.get("status")}
+    combined["status"] = next((st for st in AUTH_STATUS_PRECEDENCE if st in statuses), "unverified")
+    return combined
 
 
 # ── Ad data helpers ───────────────────────────────────────────────────────────
@@ -478,9 +774,13 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     """
     if not AUTH_ACTOR:
         log("  ❌ AUTH_ACTOR_ID env var not set — deploy the meta-auth-actor first")
-        return []
+        return [], classify_auth_state(bool(cookies_list), None, None, [])
 
-    log(f"  🔐 Authenticated mode — running actor {AUTH_ACTOR}")
+    # cookies_stored is a fact (we have them); it is NOT proof the Facebook
+    # session behind them is still valid, so we don't call this "Authenticated
+    # mode" yet -- that claim is only made after the run comes back and is
+    # classified below.
+    log(f"  🔐 cookies_stored — attempting authenticated run via actor {AUTH_ACTOR}")
     try:
         run = api_post(f"acts/{AUTH_ACTOR}/runs", {
             "urls":    search_urls,
@@ -488,16 +788,26 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
             "count":   count,
         })
         run_id = run["data"]["id"]
-        ads = wait_for_run(run_id, log)
-        log(f"  🔐 {len(ads)} ads from auth actor")
-        # Actor returns same snake_case format as curious_coder
-        # but force gated_type to ELIGIBLE since we're authenticated
-        for ad in ads:
-            ad["gated_type"] = "ELIGIBLE"
-        return ads
+        ads, run_meta = wait_for_run(run_id, log)
+        auth_state = classify_auth_state(True, run_meta.get("status"), run_meta.get("status_message"), ads,
+                                          telemetry=run_meta.get("telemetry"))
+        # Deliberately NOT forcing ad["gated_type"] = "ELIGIBLE" here anymore.
+        # Whatever gate status the actor itself assigned per ad is the only
+        # real signal of whether that specific ad's authenticated content was
+        # actually unlocked -- overwriting it just because cookies were
+        # supplied is exactly the false "authenticated" claim this fix removes.
+        if auth_state["session_valid"] is True:
+            log(f"  🔐 Authenticated — {len(ads)} ads from auth actor")
+        elif auth_state["session_valid"] == "unknown":
+            log(f"  🔐 Run completed but could not confirm session validity — {len(ads)} ads from auth actor")
+        else:
+            reasons = [k for k in ("session_expired", "checkpoint_required", "csrf_tokens_missing") if auth_state[k]]
+            reason_txt = f" ({', '.join(reasons)})" if reasons else ""
+            log(f"  ⚠️ Authenticated run did not confirm a valid session{reason_txt} — {len(ads)} ads from auth actor")
+        return ads, auth_state
     except Exception as e:
         log(f"  ❌ Auth actor failed: {e}")
-        return []
+        return [], classify_auth_state(True, "FAILED", str(e), [])
 
 
 # ── Scrape worker ─────────────────────────────────────────────────────────────
@@ -514,6 +824,7 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
         _country = country or "US"
         _status  = ad_status if ad_status in ("active", "all") else "active"
         results  = [[] for _ in searches]
+        auth_states = [None for _ in searches]
 
         def run_search(i, queries):
             log(f"🔍 Search {i+1}/{len(searches)}: {queries}")
@@ -549,12 +860,13 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
                     return
 
                 if cookies:
-                    ads = meta_auth_search(urls, cookies, count=20,
+                    ads, auth_state = meta_auth_search(urls, cookies, count=AUTH_ACTOR_COUNT,
                                            country=_country, ad_status=_status, log=log)
+                    auth_states[i] = auth_state
                 else:
                     run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15, "scrapeAdDetails": True})
                     run_id = run["data"]["id"]
-                    ads    = wait_for_run(run_id, log)
+                    ads, _run_meta = wait_for_run(run_id, log)
                 log(f"   ✓ {len(ads)} ads returned")
                 results[i] = ads
             except Exception as e:
@@ -594,6 +906,17 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
             unique = capped
 
         log(f"📊 {len(unique)} unique ads")
+
+        job["auth_state"] = combine_auth_states([s for s in auth_states if s is not None])
+        st = job["auth_state"]
+        log(
+            f"🔐 Auth state: cookies_stored={st['cookies_stored']} "
+            f"session_valid={st['session_valid']} "
+            f"session_expired={st['session_expired']} "
+            f"checkpoint_required={st['checkpoint_required']} "
+            f"csrf_tokens_missing={st['csrf_tokens_missing']}"
+        )
+
         # DEBUG: dump snapshot structure of the first ad with no extractable creative
         for ad in unique:
             imgs_dbg, vids_dbg = extract_urls(ad)
@@ -2071,7 +2394,11 @@ def start():
 @app.route("/status/<job_id>")
 def status(job_id):
     job = jobs.get(job_id, {})
-    return jsonify({"status": job.get("status", "unknown"), "log": job.get("log", [])})
+    return jsonify({
+        "status": job.get("status", "unknown"),
+        "log": job.get("log", []),
+        "auth_state": job.get("auth_state"),
+    })
 
 @app.route("/cookies/status")
 def cookies_status():
