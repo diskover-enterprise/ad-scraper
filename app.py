@@ -444,10 +444,13 @@ def fb_page_to_adlib_url(page_url, status, country):
         return None
     # Use a CONCRETE country (not ALL) — country=ALL makes the Ad Library show a
     # country picker in a headless browser and never fires the ad-results query.
-    # active_status=all includes both active and inactive ads.
+    # Honor the caller's selected status (e.g. "active" for Active Only, "all"
+    # for All Ads) instead of hardcoding — a competitor exact-page search must
+    # respect the same status filter as keyword/domain searches.
+    _status = status if status in ("active", "all") else "active"
     return (
         f"https://www.facebook.com/ads/library/"
-        f"?active_status=all&ad_type=all&country={country or 'US'}"
+        f"?active_status={_status}&ad_type=all&country={country or 'US'}"
         f"&view_all_page_id={page_id}&search_type=page&media_type=all"
     )
 
