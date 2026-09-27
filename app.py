@@ -4,8 +4,8 @@ Uses curious_coder/facebook-ads-library-scraper (actor: XtaWFhbtfxyzqrFmd)
 Deploy on Railway — set APIFY_TOKEN env var.
 """
 
-import json, time, threading, uuid, urllib.request, os, re, io, wave, base64
-from urllib.parse import urlparse, quote as urlquote, parse_qs
+import json, time, threading, uuid, urllib.request, os, re, io, wave, base64, ipaddress
+from urllib.parse import urlparse, quote as urlquote, parse_qs, urlsplit, urljoin
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 
@@ -2431,48 +2431,159 @@ def cookies_unlock():
     clear_locked_cookies()
     return jsonify({"ok": True})
 
+# ── Safe media fetch boundary (fbcdn only) ──────────────────────────────────
+# The ONLY path by which server-side code fetches ad media: /img, /vid and
+# _fetch_media (Gemini analysis) all go through safe_fetch_media(). Every URL,
+# including every redirect target, must pass validate_media_url(); anything
+# malformed or ambiguous is rejected rather than "cleaned up".
+
+MEDIA_ALLOWED_DOMAIN  = "fbcdn.net"
+MEDIA_MAX_REDIRECTS   = 3
+MEDIA_IMAGE_MAX_BYTES = 15 * 1024 * 1024
+MEDIA_VIDEO_MAX_BYTES = 150 * 1024 * 1024
+MEDIA_TIMEOUTS        = {"image": 15, "video": 60, "media": 60}
+MEDIA_ALLOWED_TYPES   = {"image": ("image/",), "video": ("video/",), "media": ("image/", "video/")}
+MEDIA_BLOCKED_MIMES   = frozenset({"image/svg+xml"})  # scriptable; never serve it from our origin
+MEDIA_REDIRECT_CODES  = frozenset({301, 302, 303, 307, 308})
+_MEDIA_NETLOC_RE      = re.compile(r"[A-Za-z0-9.-]+(?::443)?")
+_MEDIA_LABEL_RE       = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_MEDIA_MIME_RE        = re.compile(r"(?:image|video)/[a-z0-9][a-z0-9.+-]*")
+_MEDIA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer":    "https://www.facebook.com/",
+}
+
+class MediaFetchError(Exception):
+    """A media URL or upstream response failed the safe-fetch policy."""
+
+def validate_media_url(url):
+    """Return `url` unchanged if it is an allowed fbcdn HTTPS URL, else raise
+    MediaFetchError. The query string is preserved byte-for-byte so signed
+    URLs (oh=/oe= params) keep working."""
+    if not isinstance(url, str) or not url:
+        raise MediaFetchError("empty media URL")
+    # Control chars, whitespace, backslashes and non-ASCII are all ways to make
+    # different URL parsers disagree about the host — refuse them outright.
+    if any(ord(c) <= 0x20 or ord(c) >= 0x7f or c == "\\" for c in url):
+        raise MediaFetchError("media URL contains disallowed characters")
+    if url[:8].lower() != "https://":
+        raise MediaFetchError("media URL must use https")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise MediaFetchError("malformed media URL")
+    if parts.scheme != "https":
+        raise MediaFetchError("media URL must use https")
+    # Allows only host[:443] — rejects userinfo (@), other ports, empty port,
+    # IPv6 brackets and anything else unexpected in the authority.
+    if not _MEDIA_NETLOC_RE.fullmatch(parts.netloc):
+        raise MediaFetchError("media URL authority not allowed")
+    host = parts.netloc.split(":", 1)[0].lower()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise MediaFetchError("IP literal media hosts are not allowed")
+    labels = host.split(".")
+    if not all(_MEDIA_LABEL_RE.fullmatch(label) for label in labels):
+        raise MediaFetchError("malformed media host")
+    if host != MEDIA_ALLOWED_DOMAIN and not host.endswith("." + MEDIA_ALLOWED_DOMAIN):
+        raise MediaFetchError("media host not allowed")
+    return url
+
+def _media_open(url, timeout):
+    """Issue ONE GET for an already-validated URL. The opener has only HTTPS
+    (plus env proxy) handlers — no file/ftp/data/http handlers and no redirect
+    or error processors — so 3xx responses are returned to safe_fetch_media
+    for revalidation instead of being followed automatically."""
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.ProxyHandler(), urllib.request.HTTPSHandler(),
+                    urllib.request.UnknownHandler()):
+        opener.add_handler(handler)
+    return opener.open(urllib.request.Request(url, headers=_MEDIA_HEADERS), timeout=timeout)
+
+def _read_bounded(resp, limit):
+    """Read the body, failing as soon as it exceeds `limit` bytes."""
+    chunks, total = [], 0
+    while True:
+        chunk = resp.read(min(64 * 1024, limit + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise MediaFetchError("media body exceeds size limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def safe_fetch_media(url, kind):
+    """Fetch fbcdn media under the safe-fetch policy. `kind` is "image",
+    "video" or "media" (either). Returns (bytes, mime). Raises
+    MediaFetchError on any policy violation; network errors propagate."""
+    allowed = MEDIA_ALLOWED_TYPES[kind]
+    current = validate_media_url(url)
+    for hop in range(MEDIA_MAX_REDIRECTS + 1):
+        resp = _media_open(current, MEDIA_TIMEOUTS[kind])
+        try:
+            status = resp.status
+            if status in MEDIA_REDIRECT_CODES:
+                location = resp.headers.get("Location")
+                if not location:
+                    raise MediaFetchError("redirect without Location")
+                if hop >= MEDIA_MAX_REDIRECTS:
+                    raise MediaFetchError("too many media redirects")
+                current = validate_media_url(urljoin(current, location))
+                continue
+            if status != 200:
+                raise MediaFetchError(f"upstream media status {status}")
+            mime = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if (not _MEDIA_MIME_RE.fullmatch(mime) or not mime.startswith(allowed)
+                    or mime in MEDIA_BLOCKED_MIMES):
+                raise MediaFetchError("media Content-Type not allowed")
+            limit = MEDIA_IMAGE_MAX_BYTES if mime.startswith("image/") else MEDIA_VIDEO_MAX_BYTES
+            length = resp.headers.get("Content-Length")
+            if length is not None:
+                length = length.strip()
+                if not re.fullmatch(r"[0-9]{1,15}", length):
+                    raise MediaFetchError("malformed Content-Length")
+                if int(length) > limit:
+                    raise MediaFetchError("media Content-Length exceeds size limit")
+            return _read_bounded(resp, limit), mime
+        finally:
+            resp.close()
+    raise MediaFetchError("too many media redirects")
+
+def _media_proxy_response(data, mimetype, status=200):
+    """Proxy response with nosniff and private (never shared-cache) caching."""
+    resp = app.response_class(data, status=status, mimetype=mimetype)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "private, max-age=3600" if status == 200 else "no-store"
+    return resp
+
+def _proxy_media_route(kind):
+    url = request.args.get("u", "")
+    try:
+        validate_media_url(url)
+    except MediaFetchError:
+        return _media_proxy_response(b"", "text/plain", 400)
+    try:
+        data, mime = safe_fetch_media(url, kind)
+    except Exception:
+        return _media_proxy_response(b"", "text/plain", 502)
+    return _media_proxy_response(data, mime)
+
 @app.route("/img")
 def proxy_img():
     """Server-side proxy for Facebook CDN images.
     Facebook signed URLs (oh= hash) are tied to the requester's session/IP.
     Fetching server-side avoids browser-level auth failures.
     """
-    url = request.args.get("u", "")
-    if not url or "fbcdn.net" not in url:
-        return "", 400
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://www.facebook.com/",
-        })
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read()
-            ct   = r.headers.get("Content-Type", "image/jpeg")
-        resp = app.response_class(data, mimetype=ct)
-        resp.headers["Cache-Control"] = "public, max-age=3600"
-        return resp
-    except Exception:
-        return "", 502
+    return _proxy_media_route("image")
 
 @app.route("/vid")
 def proxy_vid():
     """Server-side proxy for Facebook CDN videos — bypasses browser CORS."""
-    url = request.args.get("u", "")
-    if not url or "fbcdn.net" not in url:
-        return "", 400
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://www.facebook.com/",
-        })
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = r.read()
-            ct   = r.headers.get("Content-Type", "video/mp4")
-        resp = app.response_class(data, mimetype=ct)
-        resp.headers["Cache-Control"] = "public, max-age=3600"
-        return resp
-    except Exception:
-        return "", 502
+    return _proxy_media_route("video")
 
 # ── Gemini creative analysis ──────────────────────────────────────────────
 
@@ -2495,15 +2606,11 @@ FILTER_SAFE_RULES = (
     "==============================================================\n\n"
 )
 
-def _fetch_media(url):
-    """Download an image/video from Facebook CDN. Returns (bytes, content_type) or (None, None)."""
+def _fetch_media(url, kind="media"):
+    """Download an image/video from Facebook CDN via safe_fetch_media.
+    Returns (bytes, content_type) or (None, None)."""
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer":    "https://www.facebook.com/",
-        })
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return r.read(), r.headers.get("Content-Type", "")
+        return safe_fetch_media(url, kind)
     except Exception as e:
         print(f"[GEMINI] media fetch failed: {e}")
         return None, None
@@ -2568,7 +2675,7 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
 
     # Prefer the video if present, else the first image
     if vid_urls:
-        raw, ct = _fetch_media(vid_urls[0])
+        raw, ct = _fetch_media(vid_urls[0], "video")
         if raw:
             mime = ct if ct.startswith("video/") else "video/mp4"
             file_uri = _gemini_upload_file(raw, mime, api_key)
@@ -2576,7 +2683,7 @@ def gemini_analyze(adv, title, body, img_urls, vid_urls):
                 parts.append({"file_data": {"mime_type": mime, "file_uri": file_uri}})
                 media_kind = "video"
     if media_kind is None and img_urls:
-        raw, ct = _fetch_media(img_urls[0])
+        raw, ct = _fetch_media(img_urls[0], "image")
         if raw:
             mime = ct if ct.startswith("image/") else "image/jpeg"
             b64  = __import__("base64").b64encode(raw).decode()
@@ -2691,7 +2798,7 @@ def gemini_analyze_beats(adv, title, body, img_urls, vid_urls):
     parts = []
     media_kind = None
     if vid_urls:
-        raw, ct = _fetch_media(vid_urls[0])
+        raw, ct = _fetch_media(vid_urls[0], "video")
         if raw:
             mime = ct if ct.startswith("video/") else "video/mp4"
             file_uri = _gemini_upload_file(raw, mime, api_key)
@@ -2699,7 +2806,7 @@ def gemini_analyze_beats(adv, title, body, img_urls, vid_urls):
                 parts.append({"file_data": {"mime_type": mime, "file_uri": file_uri}})
                 media_kind = "video"
     if media_kind is None and img_urls:
-        raw, ct = _fetch_media(img_urls[0])
+        raw, ct = _fetch_media(img_urls[0], "image")
         if raw:
             mime = ct if ct.startswith("image/") else "image/jpeg"
             b64  = __import__("base64").b64encode(raw).decode()
@@ -2862,6 +2969,13 @@ def analyze_beats():
 
 _HF_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
+# request_id is caller-supplied and goes into an authenticated upstream URL
+# path, so it must be validated locally before any request is built.
+HIGGSFIELD_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+def valid_higgsfield_request_id(rid):
+    return isinstance(rid, str) and HIGGSFIELD_REQUEST_ID_RE.fullmatch(rid) is not None
+
 # Higgsfield text-to-image model — overridable via env var
 HIGGSFIELD_IMAGE_MODEL = os.environ.get("HIGGSFIELD_IMAGE_MODEL", "higgsfield-ai/soul/standard")
 
@@ -2922,6 +3036,8 @@ def generate_image_status():
     """Poll Higgsfield for an image request. Returns image_url when completed."""
     data = request.json or {}
     rid  = data.get("request_id", "")
+    if not valid_higgsfield_request_id(rid):
+        return jsonify({"status": "error", "message": "Invalid request_id"}), 400
     auth = _higgsfield_auth()
     if not auth or not rid:
         return jsonify({"status": "error", "message": "Missing request_id or credentials"}), 400
@@ -3007,6 +3123,8 @@ def generate_video_status():
     """Poll Higgsfield for a request's status. Returns video_url when completed."""
     data = request.json or {}
     rid  = data.get("request_id", "")
+    if not valid_higgsfield_request_id(rid):
+        return jsonify({"status": "error", "message": "Invalid request_id"}), 400
     auth = _higgsfield_auth()
     if not auth or not rid:
         return jsonify({"status": "error", "message": "Missing request_id or credentials"}), 400
