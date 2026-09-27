@@ -6,11 +6,11 @@ Deploy on Railway — set APIFY_TOKEN env var.
 
 import json, time, threading, uuid, urllib.request, os, re, io, wave, base64, ipaddress
 from urllib.parse import urlparse, quote as urlquote, parse_qs, urlsplit, urljoin
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template_string
 
 app  = Flask(__name__)
-jobs = {}        # { job_id: {status, log, html} }
+jobs = {}        # { job_id: {status, log, html, ads, params, auth_state, ...} } -- never cookies
 last_job_id = None  # track most recent job for /logs endpoint
 
 # Locked cookies — stored in a file so every gunicorn worker can read them.
@@ -608,6 +608,24 @@ def normalize_ad(ad):
     }
 
 
+def ad_record(ad):
+    """The retained / JSON form of one ad: normalize_ad() plus the creative
+    URLs, format and translation the viewer renders. Built only from ad
+    content fields -- never the raw actor record.
+    """
+    imgs, vids = extract_urls(ad)
+    rec = normalize_ad(ad)
+    rec.update({
+        "format":               "VIDEO" if vids else ("IMAGE" if imgs else "UNKNOWN"),
+        "images":               imgs,
+        "videos":               vids,
+        "gated_type":           ad.get("gated_type") or "",
+        "translation":          ad.get("_translation") or "",
+        "translation_language": ad.get("_trans_lang") or "",
+    })
+    return rec
+
+
 # ── Translation ────────────────────────────────────────────────────────────
 
 # Common English function words — cheap local language guess (no API call)
@@ -929,12 +947,19 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
                 print(f"[NOCREATIVE] sample = {json.dumps(snap_dbg)[:1200]}")
                 break
         translate_ads_bulk(unique, log)
+        # Retain the same normalized ads the viewer renders so the JSON API
+        # can serve them without HTML parsing. Set before status flips to
+        # "done" so a completed job always has its ads.
+        ads_out = [ad_record(ad) for ad in unique]
         job["html"]   = build_viewer(brand, country, unique)
+        job["ads"]    = ads_out
+        job["completed_at"] = datetime.now(timezone.utc).isoformat()
         job["status"] = "done"
         log("✅ Done!")
 
     except Exception as e:
         import traceback
+        job["error"]  = str(e)
         job["status"] = "error"
         log(f"❌ {e}")
         log(traceback.format_exc())
@@ -2326,6 +2351,97 @@ poll();
 </body></html>"""
 
 
+# ── Scrape job launch (shared by POST /start and POST /api/v1/scrapes) ───────
+
+def prepare_scrape(kw_lines, domain_lines, page_urls, country, ad_status, per_page, cookies_raw=""):
+    """Turn raw scrape inputs into run_job arguments.
+
+    Both the browser form and the JSON API go through here and then
+    launch_scrape_job(), so they hand identical arguments to the same run_job.
+    """
+    # Bulk keywords — one search per line (comma within a line = OR group)
+    searches = [[q.strip() for q in ln.split(",") if q.strip()] for ln in kw_lines]
+
+    # Bulk domains — clean each to a bare hostname
+    domains = []
+    for d in domain_lines:
+        raw = d if "://" in d else "https://" + d
+        host = urlparse(raw).netloc or d
+        if host:
+            domains.append(host)
+
+    first_kw = kw_lines[0] if kw_lines else ""
+    brand    = first_kw or (domains[0] if domains else "") or (page_urls[0] if page_urls else "") or "Meta Ads"
+
+    # If only domains/pages provided (no keywords), still fire one thread
+    if not searches:
+        searches = [[]]
+
+    # Parse optional Facebook session cookies (Cookie-Editor JSON export).
+    # If none were supplied, fall back to locked cookies (if any).
+    cookies = None
+    cookies_raw = (cookies_raw or "").strip()
+    if cookies_raw:
+        try:
+            cookies = json.loads(cookies_raw)
+            if not isinstance(cookies, list):
+                cookies = None
+        except Exception:
+            cookies = None
+    if cookies is None:
+        locked = get_locked_cookies()
+        if locked:
+            cookies = locked
+
+    return {
+        "brand":     brand,
+        "country":   country,
+        "searches":  searches,
+        "domains":   domains,
+        "page_urls": page_urls,
+        "ad_status": ad_status,
+        "cookies":   cookies,
+        "per_page":  per_page,
+    }
+
+
+def launch_scrape_job(params):
+    """Register a job and start run_job on a background thread; returns job_id.
+
+    Cookies go to the worker thread only -- they are never stored on the job
+    record, which is what /status and the JSON API read from. The retained
+    `params` keep only page refs that resolve to a page ID, so junk pasted
+    into the pages box (e.g. cookie JSON lines) is never echoed back.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {
+        "status": "running",
+        "log":    [],
+        "html":   None,
+        "params": {
+            "country":   params["country"],
+            "ad_status": params["ad_status"],
+            "per_page":  params["per_page"],
+            "searches":  [list(s) for s in params["searches"] if s],
+            "domains":   list(params["domains"]),
+            "page_urls": [p for p in params["page_urls"]
+                          if fb_page_to_adlib_url(p, params["ad_status"], params["country"])],
+        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    global last_job_id
+    last_job_id = job_id
+
+    threading.Thread(
+        target=run_job,
+        args=(job_id, params["brand"], params["country"], params["searches"],
+              params["domains"], params["page_urls"], params["ad_status"]),
+        kwargs={"cookies": params["cookies"], "per_page": params["per_page"]},
+        daemon=True
+    ).start()
+    return job_id
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -2342,57 +2458,20 @@ def start():
     def split_lines(field):
         return [ln.strip() for ln in request.form.get(field, "").splitlines() if ln.strip()]
 
-    # Bulk keywords — one search per line (comma within a line = OR group)
-    kw_lines = split_lines("keywords_bulk")
-    searches = [[q.strip() for q in ln.split(",") if q.strip()] for ln in kw_lines]
+    # Bulk keywords / domains / Facebook pages (URLs or bare IDs), one per line.
+    # If the cookies textarea is empty, prepare_scrape falls back to locked cookies.
+    params = prepare_scrape(
+        kw_lines     = split_lines("keywords_bulk"),
+        domain_lines = split_lines("domains_bulk"),
+        page_urls    = split_lines("pages_bulk"),
+        country      = country,
+        ad_status    = ad_status,
+        per_page     = per_page,
+        cookies_raw  = request.form.get("cookies", ""),
+    )
+    job_id = launch_scrape_job(params)
 
-    # Bulk domains — clean each to a bare hostname
-    domains = []
-    for d in split_lines("domains_bulk"):
-        raw = d if "://" in d else "https://" + d
-        host = urlparse(raw).netloc or d
-        if host:
-            domains.append(host)
-
-    # Bulk Facebook pages — URLs or bare IDs
-    page_urls = split_lines("pages_bulk")
-
-    first_kw = kw_lines[0] if kw_lines else ""
-    brand    = first_kw or (domains[0] if domains else "") or (page_urls[0] if page_urls else "") or "Meta Ads"
-
-    # If only domains/pages provided (no keywords), still fire one thread
-    if not searches:
-        searches = [[]]
-
-    # Parse optional Facebook session cookies (Cookie-Editor JSON export).
-    # If the textarea is empty, fall back to locked cookies (if any).
-    cookies = None
-    cookies_raw = request.form.get("cookies", "").strip()
-    if cookies_raw:
-        try:
-            cookies = json.loads(cookies_raw)
-            if not isinstance(cookies, list):
-                cookies = None
-        except Exception:
-            cookies = None
-    if cookies is None:
-        locked = get_locked_cookies()
-        if locked:
-            cookies = locked
-
-    job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {"status": "running", "log": [], "html": None}
-    global last_job_id
-    last_job_id = job_id
-
-    threading.Thread(
-        target=run_job,
-        args=(job_id, brand, country, searches, domains, page_urls, ad_status),
-        kwargs={"cookies": cookies, "per_page": per_page},
-        daemon=True
-    ).start()
-
-    return render_template_string(PROGRESS_HTML, job_id=job_id, brand=brand)
+    return render_template_string(PROGRESS_HTML, job_id=job_id, brand=params["brand"])
 
 @app.route("/status/<job_id>")
 def status(job_id):
@@ -3252,6 +3331,156 @@ def result(job_id):
     if job["status"] == "done" and job.get("html"):
         return job["html"]
     return "Still running or error", 202
+
+# ── JSON scrape API (/api/v1/scrapes) ────────────────────────────────────────
+# Programmatic front door to the same prepare_scrape → launch_scrape_job →
+# run_job path the browser form uses. Responses are assembled from an explicit
+# allowlist of job fields (the job record never holds cookies to begin with).
+# The API does not accept cookies: authenticated runs use the locked cookies,
+# exactly as the form does when its cookies box is left empty.
+
+API_SCRAPE_FIELDS = ("page_ids", "page_urls", "keywords", "domains", "country", "ad_status", "per_page")
+API_COUNTRY_CODES = frozenset(code for code, _label in COUNTRIES)
+API_JOB_STATUS    = {"running": "running", "done": "completed", "error": "failed"}
+API_PAGE_ID_RE    = re.compile(r"\d{6,20}")
+
+
+class ScrapeRequestError(ValueError):
+    """A POST /api/v1/scrapes body failed validation."""
+
+
+def parse_scrape_request(body):
+    """Validate a POST /api/v1/scrapes body into prepare_scrape() kwargs.
+
+    Raises ScrapeRequestError with a caller-safe message (it names fields and
+    list positions, never echoes submitted values).
+    """
+    if not isinstance(body, dict):
+        raise ScrapeRequestError("Request body must be a JSON object")
+    unknown = sorted(set(body) - set(API_SCRAPE_FIELDS))
+    if unknown:
+        raise ScrapeRequestError(
+            f"Unsupported field(s): {', '.join(unknown)}. Allowed: {', '.join(API_SCRAPE_FIELDS)}")
+
+    country = body.get("country", "US")
+    if not isinstance(country, str) or country.strip().upper() not in API_COUNTRY_CODES:
+        codes = ", ".join(sorted(c for c in API_COUNTRY_CODES if c))
+        raise ScrapeRequestError(f'country must be one of: {codes} (or "" for all regions)')
+    country = country.strip().upper()
+
+    ad_status = body.get("ad_status", "active")
+    if ad_status not in ("active", "all"):
+        raise ScrapeRequestError('ad_status must be "active" or "all"')
+
+    per_page = body.get("per_page", 0)
+    if isinstance(per_page, bool) or not isinstance(per_page, int) or per_page < 0:
+        raise ScrapeRequestError("per_page must be a non-negative integer (0 = no per-page cap)")
+
+    def str_list(field, allow_int=False):
+        val = body.get(field)
+        if val is None:
+            return []
+        ok_types = (str, int) if allow_int else (str,)
+        if not isinstance(val, list) or any(isinstance(v, bool) or not isinstance(v, ok_types) for v in val):
+            kind = "strings or integers" if allow_int else "strings"
+            raise ScrapeRequestError(f"{field} must be a list of {kind}")
+        return [str(v).strip() for v in val if str(v).strip()]
+
+    page_ids  = str_list("page_ids", allow_int=True)
+    page_urls = str_list("page_urls")
+    keywords  = str_list("keywords")
+    domains   = str_list("domains")
+
+    for i, pid in enumerate(page_ids):
+        if not API_PAGE_ID_RE.fullmatch(pid):
+            raise ScrapeRequestError(f"page_ids[{i}] must be a numeric Facebook page ID (6-20 digits)")
+    for i, url in enumerate(page_urls):
+        if not fb_page_to_adlib_url(url, ad_status, country):
+            raise ScrapeRequestError(f"page_urls[{i}] does not contain a recognizable Facebook page ID")
+
+    if not (page_ids or page_urls or keywords or domains):
+        raise ScrapeRequestError("Provide at least one of: page_ids, page_urls, keywords, domains")
+
+    return {
+        "kw_lines":     keywords,
+        "domain_lines": domains,
+        "page_urls":    page_ids + page_urls,
+        "country":      country,
+        "ad_status":    ad_status,
+        "per_page":     per_page,
+    }
+
+
+def _api_error(code, message, http_status, **extra):
+    body = dict(extra)
+    body["error"] = {"code": code, "message": message}
+    return jsonify(body), http_status
+
+
+def _api_job_summary(job_id, job):
+    return {
+        "job_id":       job_id,
+        "status":       API_JOB_STATUS.get(job.get("status"), job.get("status") or "unknown"),
+        "auth_state":   job.get("auth_state"),
+        "params":       job.get("params"),
+        "created_at":   job.get("created_at"),
+        "completed_at": job.get("completed_at"),
+    }
+
+
+def _api_job_failure(job):
+    return {
+        "code":     "scrape_failed",
+        "message":  job.get("error") or "Scrape failed",
+        "log_tail": list(job.get("log", []))[-5:],
+    }
+
+
+@app.route("/api/v1/scrapes", methods=["POST"])
+def api_start_scrape():
+    try:
+        inputs = parse_scrape_request(request.get_json(silent=True))
+    except ScrapeRequestError as e:
+        return _api_error("invalid_request", str(e), 400)
+    job_id = launch_scrape_job(prepare_scrape(**inputs))
+    return jsonify({
+        "job_id":     job_id,
+        "status":     "running",
+        "status_url": f"/api/v1/scrapes/{job_id}",
+        "result_url": f"/api/v1/scrapes/{job_id}/result",
+    }), 202
+
+@app.route("/api/v1/scrapes/<job_id>")
+def api_scrape_status(job_id):
+    job = jobs.get(job_id)
+    if job is None:
+        return _api_error("not_found", "Unknown job_id", 404, job_id=job_id)
+    body = _api_job_summary(job_id, job)
+    body["log"] = list(job.get("log", []))
+    if job.get("status") == "done":
+        body["count"] = len(job.get("ads") or [])
+    elif job.get("status") == "error":
+        body["error"] = _api_job_failure(job)
+    return jsonify(body)
+
+@app.route("/api/v1/scrapes/<job_id>/result")
+def api_scrape_result(job_id):
+    job = jobs.get(job_id)
+    if job is None:
+        return _api_error("not_found", "Unknown job_id", 404, job_id=job_id)
+    body = _api_job_summary(job_id, job)
+    if job.get("status") == "done":
+        ads = list(job.get("ads") or [])
+        body.update({"completed": True, "count": len(ads), "ads": ads})
+        return jsonify(body)
+    # Not completed: never return partial ads, whatever the job record holds.
+    body["completed"] = False
+    if job.get("status") == "error":
+        body["error"] = _api_job_failure(job)
+    else:
+        body["error"] = {"code": "not_completed",
+                         "message": "Scrape has not completed; poll the status endpoint and retry"}
+    return jsonify(body), 409
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)

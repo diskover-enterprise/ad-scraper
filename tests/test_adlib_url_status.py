@@ -141,10 +141,14 @@ def load_run_job_namespace(capture, ad_status_seen):
         }
 
     import json as json_module
+    from datetime import datetime, timezone
 
     ns = {
         "re": re,
         "json": json_module,
+        "datetime": datetime,
+        "timezone": timezone,
+        "ad_record": lambda ad: dict(ad),
         "threading": threading,
         "urlquote": urlquote,
         "jobs": {},
