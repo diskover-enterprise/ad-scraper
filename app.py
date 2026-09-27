@@ -4,7 +4,7 @@ Uses curious_coder/facebook-ads-library-scraper (actor: XtaWFhbtfxyzqrFmd)
 Deploy on Railway — set APIFY_TOKEN env var.
 """
 
-import json, time, threading, uuid, urllib.request, os, re, io, wave, base64, ipaddress
+import json, time, threading, uuid, urllib.request, os, re, io, wave, base64, ipaddress, zipfile
 from urllib.parse import urlparse, quote as urlquote, parse_qs, urlsplit, urljoin
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template_string
@@ -953,6 +953,7 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
         ads_out = [ad_record(ad) for ad in unique]
         job["html"]   = build_viewer(brand, country, unique)
         job["ads"]    = ads_out
+        job["brand"]  = brand  # viewer KEYWORD source, reused by the ZIP export folder names
         job["completed_at"] = datetime.now(timezone.utc).isoformat()
         job["status"] = "done"
         log("✅ Done!")
@@ -966,6 +967,23 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
 
 
 # ── Viewer builder ─────────────────────────────────────────────────────────────
+
+def viewer_brand_slug(brand):
+    """The viewer's KEYWORD (used in Download ZIP folder names): a clean label
+    for filenames — the meaningful part pulled out of a URL/domain."""
+    label = brand
+    if "facebook.com/" in label:
+        # Facebook page URL → use the page name (last path segment)
+        seg = label.rstrip("/").split("facebook.com/")[-1].split("/")[0].split("?")[0]
+        label = seg or label
+    elif "://" in label or "." in label and "/" in label:
+        # Full URL → hostname without www.
+        label = (urlparse(label if "://" in label else "https://" + label).netloc or label).replace("www.", "")
+    elif label.count(".") >= 1 and " " not in label:
+        # Bare domain like get-novaburn.com → strip www.
+        label = label.replace("www.", "")
+    return label.replace(" ", "_")
+
 
 def build_viewer(brand, country, ads):
     C = "#1877f2"  # Meta blue
@@ -1142,19 +1160,7 @@ def build_viewer(brand, country, ads):
     cards_html = "\n".join(card(a) for a in ads)
     rows_html  = "\n".join(trow(a) for a in ads)
 
-    # Clean label for filenames — pull the meaningful part out of a URL/domain
-    label = brand
-    if "facebook.com/" in label:
-        # Facebook page URL → use the page name (last path segment)
-        seg = label.rstrip("/").split("facebook.com/")[-1].split("/")[0].split("?")[0]
-        label = seg or label
-    elif "://" in label or "." in label and "/" in label:
-        # Full URL → hostname without www.
-        label = (urlparse(label if "://" in label else "https://" + label).netloc or label).replace("www.", "")
-    elif label.count(".") >= 1 and " " not in label:
-        # Bare domain like get-novaburn.com → strip www.
-        label = label.replace("www.", "")
-    brand_slug = label.replace(" ", "_")
+    brand_slug = viewer_brand_slug(brand)
 
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>{brand} — Meta Ad Intelligence</title>
@@ -3481,6 +3487,155 @@ def api_scrape_result(job_id):
         body["error"] = {"code": "not_completed",
                          "message": "Scrape has not completed; poll the status endpoint and retry"}
     return jsonify(body), 409
+
+# ── Programmatic ZIP export (/api/v1/scrapes/<job_id>/export) ────────────────
+# Server-side twin of the viewer's bulkZip() ("Download ZIP"), whose output
+# the Meta Mock Uploader already accepts. It rebuilds the card data-* values
+# bulkZip() reads from the retained ad_record()s (exactly as build_viewer's
+# card() writes them), then applies bulkZip()'s folder naming, file naming and
+# ad_copy.txt text. Media goes through safe_fetch_media(), the same boundary
+# behind the /img and /vid routes bulkZip() fetches from. Keep in step with
+# bulkZip() -- tests/test_scrape_export.py pins both sides.
+
+# Characters JS String.prototype.trim() removes (WhiteSpace + LineTerminator).
+_JS_TRIM_CHARS = "".join(map(chr, (
+    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B),
+    0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF,
+)))
+
+
+def _browser_slug(text, limit=30):
+    """JS `text.replace(/[^a-z0-9]/gi, '_').slice(0, limit)`. JS strings are
+    UTF-16, so a non-BMP character is two code units -> two underscores."""
+    out = "".join(c if c.isascii() and c.isalnum() else ("__" if ord(c) > 0xFFFF else "_")
+                  for c in text)
+    return out[:limit]
+
+
+def _browser_attr(text):
+    """What card.dataset returns for a value build_viewer wrote into an
+    attribute: the HTML parser turns CR / CRLF into LF."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def browser_card_dataset(ad):
+    """The card data-* values bulkZip() reads, derived from one retained
+    ad_record() the same way build_viewer's card() derives them."""
+    values = {
+        "advertiser": (ad.get("name") or "Unknown").replace('"', "'"),
+        "body":       (ad.get("body") or "").replace('"', "'").replace("\n", " ")[:300],
+        "title":      (ad.get("title") or "").replace('"', "'")[:120],
+        "date":       ad.get("date") or "",
+        "fmt":        ad.get("format") or "",
+        "cta":        ad.get("cta") or "",
+        "lp":         (ad.get("landing") or "#").replace('"', "'"),
+        "lib":        (ad.get("lib_url") or "").replace('"', "'"),
+        "status":     ad.get("status") or "",
+    }
+    return {k: _browser_attr(v) for k, v in values.items()}
+
+
+def browser_zip_folder(ds, keyword, idx):
+    """bulkZip()'s per-ad folder name and sanitized date for card number idx
+    (1-based). Returns (folder, date)."""
+    adv   = _browser_slug(ds["advertiser"] or "ad")
+    date  = re.sub(r"[^0-9-]", "", ds["date"] or "nodate") or "nodate"
+    typ   = "VIDEO" if ds["fmt"] == "VIDEO" else "STATIC"
+    kw    = _browser_slug(keyword or "ad")
+    m     = re.search(r"id=([0-9]+)", ds["lib"])
+    ad_id = m.group(1) if m else f"n{idx}"
+    return f"{date} - {kw} - {typ} - {adv} - {ad_id}", date
+
+
+def browser_ad_copy(ds, date):
+    """bulkZip()'s ad_copy.txt text. Empty optional lines are kept as blank
+    lines, as bulkZip()'s `filter(l => l !== null)` keeps them."""
+    lines = [
+        f"ADVERTISER: {ds['advertiser']}",
+        f"STATUS: {ds['status']}  |  FORMAT: {ds['fmt']}  |  DATE: {date}",
+        "",
+        f"HEADLINE:\n{ds['title']}" if ds["title"] else "",
+        "",
+        f"AD COPY:\n{ds['body']}",
+        "",
+        f"CTA: {ds['cta']}" if ds["cta"] else "",
+        f"LANDING PAGE: {ds['lp']}" if ds["lp"] else "",
+        f"AD LIBRARY: {ds['lib']}" if ds["lib"] else "",
+    ]
+    return "\n".join(lines).strip(_JS_TRIM_CHARS)
+
+
+def build_export_zip(ads, brand):
+    """The bytes of the ZIP bulkZip() builds when every card is selected.
+
+    Cards are walked in the viewer's on-load order (sortCards('date_desc'),
+    a stable newest-first sort on data-date), which is the order Select All
+    adds them and so decides the `n<idx>` folder fallback. Entries are
+    collected by name first so a repeated name overwrites the earlier one in
+    place, as JSZip's folder()/file() do. The html2canvas card_screenshot.png
+    cannot be rendered server-side and is omitted.
+    """
+    keyword = viewer_brand_slug(brand or "")
+    cards = sorted(((browser_card_dataset(ad), ad) for ad in ads),
+                   key=lambda card: card[0]["date"], reverse=True)
+    entries = {}
+    for idx, (ds, ad) in enumerate(cards, 1):
+        folder, date = browser_zip_folder(ds, keyword, idx)
+        entries.setdefault(folder + "/", b"")
+
+        # Images: same first-4 slice as data-imgs; an image that can't be
+        # fetched is skipped, as in bulkZip()'s catch.
+        for i, url in enumerate((ad.get("images") or [])[:4]):
+            try:
+                data, mime = safe_fetch_media(url, "image")
+            except Exception:
+                continue
+            ext = "png" if "png" in mime else "jpg"
+            entries[f"{folder}/image{i+1}.{ext}"] = data
+
+        # Videos: same first-3 slice as data-vids; on failure bulkZip() writes
+        # the proxied /vid URL it tried into videoN_url.txt.
+        for i, url in enumerate((ad.get("videos") or [])[:3]):
+            try:
+                data, _mime = safe_fetch_media(url, "video")
+            except Exception:
+                entries[f"{folder}/video{i+1}_url.txt"] = f"/vid?u={urlquote(url)}"
+                continue
+            entries[f"{folder}/video{i+1}.mp4"] = data
+
+        entries[f"{folder}/ad_copy.txt"] = browser_ad_copy(ds, date)
+
+    buf = io.BytesIO()
+    now = time.localtime()[:6]
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for name, data in entries.items():
+            info = zipfile.ZipInfo(name, date_time=now)
+            if name.endswith("/"):
+                info.external_attr = (0o40755 << 16) | 0x10  # directory
+            else:
+                info.external_attr = 0o644 << 16
+            zf.writestr(info, data)
+    return buf.getvalue()
+
+
+@app.route("/api/v1/scrapes/<job_id>/export")
+def api_scrape_export(job_id):
+    job = jobs.get(job_id)
+    if job is None:
+        return _api_error("not_found", "Unknown job_id", 404, job_id=job_id)
+    if job.get("status") != "done":
+        body = _api_job_summary(job_id, job)
+        body["completed"] = False
+        if job.get("status") == "error":
+            body["error"] = _api_job_failure(job)
+        else:
+            body["error"] = {"code": "not_completed",
+                             "message": "Scrape has not completed; poll the status endpoint and retry"}
+        return jsonify(body), 409
+    data = build_export_zip(list(job.get("ads") or []), job.get("brand"))
+    resp = app.response_class(data, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = 'attachment; filename="ads_download.zip"'
+    return resp
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
