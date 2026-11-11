@@ -455,7 +455,7 @@ class TestExportMatchesRealViewerData(unittest.TestCase):
     def test_card_dataset_and_keyword_match_rendered_viewer(self):
         ns = {"re": re, "urlquote": urlquote, "urlparse": urlparse, "datetime": datetime}
         for pattern in (r"^def extract_urls\(", r"^def normalize_ad\(", r"^def ad_record\(",
-                        r"^_JS_TRIM_CHARS = \(", r"^def _browser_slug\(", r"^def _browser_attr\(",
+                        r"^_JS_TRIM_CHARS = ", r"^def _browser_slug\(", r"^def _browser_attr\(",
                         r"^def browser_card_dataset\("):
             exec(api_tests.extract_block(pattern), ns)  # noqa: S102
         exec(api_tests.extract_region("# ── Viewer builder", "# ── HTML templates"), ns)  # noqa: S102
