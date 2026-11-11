@@ -72,6 +72,9 @@ def load_auth_namespace(api_get=None, api_post=None, auth_actor="test-actor-id")
     exec(extract_block(r"^def classify_auth_state\("), ns)  # noqa: S102
     exec(extract_block(r"^def combine_auth_states\("), ns)  # noqa: S102
     exec(extract_block(r"^def wait_for_run\("), ns)  # noqa: S102
+    exec(extract_block(r"^APIFY_TELEMETRY_FIELDS = \("), ns)  # noqa: S102
+    exec(extract_block(r"^MAX_APIFY_RUNS_PER_JOB = "), ns)  # noqa: S102
+    exec(extract_block(r"^def _apify_run_summary\("), ns)  # noqa: S102
     exec(extract_block(r"^def meta_auth_search\("), ns)  # noqa: S102
     return ns
 

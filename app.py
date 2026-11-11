@@ -802,6 +802,7 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     # mode" yet -- that claim is only made after the run comes back and is
     # classified below.
     log(f"  🔐 cookies_stored — attempting authenticated run via actor {AUTH_ACTOR}")
+    run_id = None
     try:
         run = api_post(f"acts/{AUTH_ACTOR}/runs", {
             "urls":    search_urls,
@@ -809,9 +810,11 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
             "count":   count,
         })
         run_id = run["data"]["id"]
+        log(f"  🆔 Apify run {run_id}")
         ads, run_meta = wait_for_run(run_id, log)
         auth_state = classify_auth_state(True, run_meta.get("status"), run_meta.get("status_message"), ads,
                                           telemetry=run_meta.get("telemetry"))
+        auth_state["apify_run"] = _apify_run_summary(run_id, run_meta, len(ads))
         # Deliberately NOT forcing ad["gated_type"] = "ELIGIBLE" here anymore.
         # Whatever gate status the actor itself assigned per ad is the only
         # real signal of whether that specific ad's authenticated content was
@@ -828,14 +831,94 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
         return ads, auth_state
     except Exception as e:
         log(f"  ❌ Auth actor failed: {e}")
-        return [], classify_auth_state(True, "FAILED", str(e), [])
+        failed = classify_auth_state(True, "FAILED", str(e), [])
+        failed["apify_run"] = _apify_run_summary(run_id, {"status": "FAILED", "telemetry": None}, 0, error=True)
+        return [], failed
+
+
+# Telemetry fields kept on the job (bounded): status/flags/counts only -- never the
+# URL, country, cookie or any value the actor saw.
+APIFY_TELEMETRY_FIELDS = ("auth_status", "checkpoint_detected", "login_wall_detected",
+                          "graphql_responses", "html_ads", "graphql_ads", "unique_ads")
+MAX_APIFY_RUNS_PER_JOB = 10
+
+
+def _apify_run_summary(run_id, run_meta, ad_count, error=False):
+    """Bounded, credential-free record of one actor run for the job and the API.
+
+    Never raises: a bug here must not discard ads that were already paid for.
+    Values are type-bound (flags only if bool, counts only if int, auth_status
+    only a short str); anything else becomes None.
+    """
+    def _telemetry_value(key, value):
+        if key in ("checkpoint_detected", "login_wall_detected"):
+            return value if isinstance(value, bool) else None
+        if key == "auth_status":
+            return value if isinstance(value, str) and len(value) <= 32 else None
+        return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10**9 else None
+
+    try:
+        entries = _normalize_telemetry_entries(run_meta.get("telemetry"))
+        telemetry, truncated = None, False
+        if entries is not None:
+            truncated = len(entries) > 10
+            telemetry = [{k: _telemetry_value(k, e.get(k)) for k in APIFY_TELEMETRY_FIELDS
+                          if isinstance(e, dict) and k in e}
+                         for e in entries[:10]]
+        status = run_meta.get("status")
+        return {
+            "run_id":    run_id if (isinstance(run_id, str) and run_id.isascii() and run_id.isalnum()
+                                    and len(run_id) <= 40) else None,
+            "status":    status if isinstance(status, str) and len(status) <= 32 else None,
+            "ads":       ad_count,
+            "error":     bool(error),
+            "telemetry": telemetry,
+            "telemetry_truncated": truncated,
+        }
+    except Exception:
+        return {"run_id": None, "status": None, "ads": ad_count, "error": bool(error),
+                "telemetry": None, "telemetry_truncated": False}
 
 
 # ── Scrape worker ─────────────────────────────────────────────────────────────
 
+def exact_page_zero_warning(searches, domains, page_urls, ads, apify_runs, expected_urls=None):
+    """A distinct warning for an exact-page (view_all_page_id) job that returned no ads.
+
+    The actor "succeeding" with an empty dataset is not evidence the page has no
+    ads: an actor that could not extract the page's ads looks identical. Only a
+    run whose own telemetry shows a verified session AND a page that loaded with
+    GraphQL traffic is reported as a confirmed zero; anything else is unverified.
+    Keyword/domain jobs are never flagged (zero there is an ordinary result).
+    """
+    exact_page = bool(page_urls) and not domains and not any(q for qs in searches for q in qs)
+    if not exact_page or ads:
+        return None
+    def _int(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    entries = [e for r in apify_runs for e in (r.get("telemetry") or []) if isinstance(e, dict)]
+    # Confirmed zero needs telemetry for EVERY url sent (no truncation, no missing
+    # run), a verified session, GraphQL traffic, and zero ads in every counter
+    # (a missing counter is unverified, not zero).
+    complete = (isinstance(expected_urls, int) and expected_urls > 0 and len(entries) == expected_urls
+                and not any(r.get("telemetry_truncated") for r in apify_runs))
+    confirmed = complete and all(
+        e.get("auth_status") == "verified" and (_int(e.get("graphql_responses")) or 0) > 0
+        and all(_int(e.get(k)) == 0 for k in ("unique_ads", "html_ads", "graphql_ads"))
+        for e in entries) and not any(r.get("error") for r in apify_runs)
+    if confirmed:
+        return {"code": "exact_page_zero_ads",
+                "message": "The exact advertiser page loaded with a verified session and returned no ads."}
+    return {"code": "exact_page_zero_unverified",
+            "message": "The exact-page scrape returned no ads without telemetry confirming the page and session "
+                       "loaded correctly; this is not a confirmed zero."}
+
+
 def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, cookies=None, per_page=0):
     job = jobs[job_id]
     def log(msg): job["log"].append(msg)
+    job.setdefault("apify_runs", [])
 
     # Backward-compat: allow single string for domains/page_urls
     if isinstance(domains, str):   domains   = [domains]   if domains   else []
@@ -846,6 +929,7 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
         _status  = ad_status if ad_status in ("active", "all") else "active"
         results  = [[] for _ in searches]
         auth_states = [None for _ in searches]
+        sent_url_counts = []  # URLs sent to an actor, per search (telemetry must cover all of them)
 
         def run_search(i, queries):
             log(f"🔍 Search {i+1}/{len(searches)}: {queries}")
@@ -879,15 +963,22 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
                 if not urls:
                     results[i] = []
                     return
+                sent_url_counts.append(len(urls))
 
                 if cookies:
                     ads, auth_state = meta_auth_search(urls, cookies, count=AUTH_ACTOR_COUNT,
                                            country=_country, ad_status=_status, log=log)
+                    apify_run = auth_state.pop("apify_run", None) if isinstance(auth_state, dict) else None
+                    if apify_run and len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
+                        job["apify_runs"].append(apify_run)
                     auth_states[i] = auth_state
                 else:
                     run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15, "scrapeAdDetails": True})
                     run_id = run["data"]["id"]
+                    log(f"  🆔 Apify run {run_id}")
                     ads, _run_meta = wait_for_run(run_id, log)
+                    if len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
+                        job["apify_runs"].append(_apify_run_summary(run_id, _run_meta, len(ads)))
                 log(f"   ✓ {len(ads)} ads returned")
                 results[i] = ads
             except Exception as e:
@@ -929,6 +1020,15 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
         log(f"📊 {len(unique)} unique ads")
 
         job["auth_state"] = combine_auth_states([s for s in auth_states if s is not None])
+        try:
+            warning = exact_page_zero_warning(searches, domains, page_urls, unique, job["apify_runs"],
+                                              expected_urls=sum(sent_url_counts))
+        except Exception as e:  # a warning bug must never fail a paid scrape
+            log(f"⚠️ exact-page warning check failed: {type(e).__name__}")
+            warning = None
+        if warning:
+            job["warning"] = warning
+            log(f"⚠️ {warning['code']}: {warning['message']}")
         st = job["auth_state"]
         log(
             f"🔐 Auth state: cookies_stored={st['cookies_stored']} "
@@ -3428,6 +3528,8 @@ def _api_job_summary(job_id, job):
         "job_id":       job_id,
         "status":       API_JOB_STATUS.get(job.get("status"), job.get("status") or "unknown"),
         "auth_state":   job.get("auth_state"),
+        "apify_runs":   list(job.get("apify_runs") or []),
+        "warning":      job.get("warning"),
         "params":       job.get("params"),
         "created_at":   job.get("created_at"),
         "completed_at": job.get("completed_at"),
@@ -3487,6 +3589,7 @@ def api_scrape_result(job_id):
         body["error"] = {"code": "not_completed",
                          "message": "Scrape has not completed; poll the status endpoint and retry"}
     return jsonify(body), 409
+
 
 # ── Programmatic ZIP export (/api/v1/scrapes/<job_id>/export) ────────────────
 # Server-side twin of the viewer's bulkZip() ("Download ZIP"), whose output

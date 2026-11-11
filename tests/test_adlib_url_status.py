@@ -161,6 +161,11 @@ def load_run_job_namespace(capture, ad_status_seen):
         "AUTH_ACTOR_COUNT": 100,
     }
     exec(extract_block(r"^def fb_page_to_adlib_url\("), ns)  # noqa: S102
+    exec(extract_block(r"^def _normalize_telemetry_entries\("), ns)  # noqa: S102
+    exec(extract_block(r"^APIFY_TELEMETRY_FIELDS = \("), ns)  # noqa: S102
+    exec(extract_block(r"^MAX_APIFY_RUNS_PER_JOB = "), ns)  # noqa: S102
+    exec(extract_block(r"^def _apify_run_summary\("), ns)  # noqa: S102
+    exec(extract_block(r"^def exact_page_zero_warning\("), ns)  # noqa: S102
     exec(extract_block(r"^def run_job\("), ns)  # noqa: S102
     return ns
 
