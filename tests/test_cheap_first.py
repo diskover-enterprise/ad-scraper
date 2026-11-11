@@ -8,6 +8,12 @@
   cookies in its payload); unacceptable/failed URLs fall back to ONE
   meta_auth_search call with only those URLs; all-cheap jobs never call it.
   With the flag off, or for keyword URLs, the old path runs unchanged.
+- With CHEAP_FIRST on and NO cookies locked, exact-page URLs still go to the cheap
+  actor first. All pages acceptable -> done (auth no_cookies_provided, never
+  verified). Any page gated / without media / zero ads / failed run / actor error
+  -> the job FAILS with error code cookies_needed and nothing more is spent (no
+  curious_coder, no auth actor, no further cheap run). Keyword/domain URLs keep
+  today's curious_coder path. Flag off = old path unchanged.
 - Every recorded run carries usage_usd and an actor label; the job cost sums.
 
 Loads app.py source blocks the same way as the other test modules (see
@@ -53,6 +59,7 @@ RUN_JOB_BLOCKS = (
     r"^def cheap_result_acceptable\(",
     r"^def cheap_actor_search\(",
     r"^def cheap_first_search\(",
+    r"^def cheap_pages_no_cookies\(",
     r"^def exact_page_zero_warning\(",
     r"^def run_job\(",
     r"^def job_apify_cost_usd\(",
@@ -162,14 +169,14 @@ def page_url(page_id):
     return f"https://www.facebook.com/profile.php?id={page_id}"
 
 
-def run_job(env, page_ids=(), keywords=(), cookies=COOKIES, cheap_pages=None, usage=0.012):
+def run_job(env, page_ids=(), keywords=(), cookies=COOKIES, cheap_pages=None, usage=0.012, expect="done"):
     fake = FakeApify(cheap_pages, usage)
     ns = load_namespace(env, fake)
     ns["jobs"]["j"] = {"status": "running", "log": []}
     ns["run_job"]("j", "Brand", "US", [list(keywords)], [], [page_url(p) for p in page_ids], "active",
                   cookies=cookies, per_page=0)
     job = ns["jobs"]["j"]
-    assert job["status"] == "done", job["log"]
+    assert job["status"] == expect, job["log"]
     return fake, job, ns
 
 
@@ -390,8 +397,8 @@ class TestRunJobCheapFirst(unittest.TestCase):
         self.assertIn("search_type=keyword_unordered", url)
         self.assertEqual(len(job["ads"]), 3)
 
-    def test_cookieless_path_never_uses_the_cheap_actor(self):
-        fake, job, _ns = run_job(FLAG_ON, page_ids=[PAGE_A], cookies=None)
+    def test_cookieless_path_flag_off_is_the_old_curious_path(self):
+        fake, job, _ns = run_job({"CHEAP_ACTOR_ID": CHEAP_ACTOR_ID}, page_ids=[PAGE_A], cookies=None)
         self.assertEqual(fake.cheap_posts(), [])
         self.assertEqual(len(fake.posts), 1)
         self.assertEqual(fake.auth_calls, [])
@@ -400,6 +407,163 @@ class TestRunJobCheapFirst(unittest.TestCase):
     def test_build_tag_goes_on_the_run_post(self):
         fake, _job, _ns = run_job(dict(FLAG_ON, CHEAP_ACTOR_BUILD="beta"), page_ids=[PAGE_A])
         self.assertEqual(fake.cheap_posts()[0][0], f"acts/{CHEAP_ACTOR_ID}/runs?build=beta")
+
+
+# ── No cookies locked (cookie-less cheap-first) ──────────────────────────────
+
+def no_cookie_job(page_ids=(), keywords=(), cheap_pages=None, env=FLAG_ON, expect="done"):
+    return run_job(env, page_ids=page_ids, keywords=keywords, cookies=None, cheap_pages=cheap_pages, expect=expect)
+
+
+class TestCheapFirstWithoutCookies(unittest.TestCase):
+    def test_all_eligible_is_served_cheaply_with_no_cookies(self):
+        fake, job, _ns = no_cookie_job([PAGE_A, PAGE_B])
+        self.assertEqual(fake.auth_calls, [])
+        self.assertEqual(len(fake.cheap_posts()), 2)
+        self.assertEqual(len(fake.posts), 2)  # no curious_coder run either
+        self.assertEqual(len(job["ads"]), 4)
+        self.assertEqual([r["actor"] for r in job["apify_runs"]], ["cheap", "cheap"])
+        self.assertNotIn("error_code", job)
+        st = job["auth_state"]  # cookies were never locked and never used: never "verified"
+        self.assertEqual((st["status"], st["cookies_stored"], st["session_valid"]), ("no_cookies_provided", False, False))
+        log = "\n".join(job["log"])
+        self.assertIn("Cheap actor OK for page " + PAGE_A, log)
+        self.assertIn("All pages served by the cheap actor", log)
+
+    def test_cheap_actor_never_receives_cookies_or_cookie_fields(self):
+        for cookies in (None, COOKIES):
+            fake, job, _ns = run_job(FLAG_ON, page_ids=[PAGE_A], cookies=cookies)
+            (path, payload), = fake.cheap_posts()
+            self.assertEqual(set(payload), {"startUrls", "resultsLimit", "maxItems"})
+            self.assertNotIn("cookie", json.dumps(payload).lower())
+            self.assertNotIn(SECRET_COOKIE_VALUE, json.dumps(payload) + "\n".join(job["log"]))
+
+    def assert_cookies_needed(self, mode, reason_fragment, **kw):
+        fake, job, _ns = no_cookie_job([PAGE_A], cheap_pages={PAGE_A: mode}, expect="error", **kw)
+        # Exactly one cheap run was paid for; nothing else ran.
+        self.assertEqual(len(fake.cheap_posts()), 1, mode)
+        self.assertEqual(len(fake.posts), 1, mode)  # no curious_coder (acts/fake-meta-actor) run
+        self.assertEqual(fake.auth_calls, [], mode)
+        self.assertEqual(job["error_code"], "cookies_needed")
+        self.assertEqual(job["cookies_needed_pages"][0]["page_id"], PAGE_A)
+        self.assertIn(reason_fragment, job["cookies_needed_pages"][0]["reason"], mode)
+        self.assertIn(f"cookies needed for Page {PAGE_A}", job["error"])
+        self.assertNotIn("ads", job)  # a failed job never carries ads
+        self.assertEqual([(r["actor"]) for r in job["apify_runs"]], ["cheap"])  # the paid run stays on the record
+        log = "\n".join(job["log"])
+        self.assertIn(f"Cookies needed for page {PAGE_A}", log)
+        self.assertIn("cookies_needed", log)
+        return job
+
+    def test_gated_page_stops_with_cookies_needed(self):
+        self.assert_cookies_needed("logged_out", "LOGGED_OUT")
+
+    def test_mixed_page_stops(self):
+        self.assert_cookies_needed("mixed", "gated_type=LOGGED_OUT")
+
+    def test_page_without_media_stops(self):
+        self.assert_cookies_needed("nomedia", "ad without media")
+
+    def test_zero_ads_stops(self):
+        self.assert_cookies_needed("empty", "no ads")
+
+    def test_failed_run_stops(self):
+        self.assert_cookies_needed("failed", "run status FAILED")
+
+    def test_cheap_actor_exception_stops_without_leaking_the_error_body(self):
+        job = self.assert_cookies_needed("raise", "cheap actor error (Exception)")
+        self.assertNotIn("boom-body", "\n".join(job["log"]) + job["error"] + str(job["cookies_needed_pages"]))
+        self.assertTrue(job["apify_runs"][0]["error"])
+
+    def test_first_failing_page_stops_the_rest_and_discards_pages_already_served(self):
+        fake, job, _ns = no_cookie_job([PAGE_A, PAGE_B, "333333333"], cheap_pages={PAGE_B: "logged_out"}, expect="error")
+        self.assertEqual(len(fake.cheap_posts()), 2)  # A (served) and B (gated); page 3 never run
+        self.assertEqual(len(fake.posts), 2)
+        self.assertEqual([c["page_id"] for c in job["cookies_needed_pages"]], [PAGE_B])
+        self.assertNotIn("ads", job)
+        self.assertEqual([r["actor"] for r in job["apify_runs"]], ["cheap", "cheap"])
+
+    def test_gated_page_with_cookies_locked_still_falls_back_to_the_auth_actor(self):
+        fake, job, _ns = run_job(FLAG_ON, page_ids=[PAGE_A], cookies=COOKIES, cheap_pages={PAGE_A: "logged_out"})
+        self.assertEqual(len(fake.auth_calls), 1)
+        self.assertEqual(fake.auth_calls[0]["cookies"], COOKIES)
+        self.assertEqual([r["actor"] for r in job["apify_runs"]], ["cheap", "auth"])
+        self.assertEqual(job["auth_state"]["status"], "verified")
+        self.assertNotIn("error_code", job)
+
+    def test_cheap_error_with_cookies_locked_still_falls_back(self):
+        fake, job, _ns = run_job(FLAG_ON, page_ids=[PAGE_A], cookies=COOKIES, cheap_pages={PAGE_A: "raise"})
+        self.assertEqual(len(fake.auth_calls), 1)
+        self.assertEqual(job["status"], "done")
+
+    def test_flag_off_no_cookies_is_the_old_curious_path(self):
+        fake, job, _ns = no_cookie_job([PAGE_A], env={"CHEAP_ACTOR_ID": CHEAP_ACTOR_ID})
+        self.assertEqual(fake.cheap_posts(), [])
+        self.assertEqual(len(fake.posts), 1)
+        self.assertEqual(fake.auth_calls, [])
+        self.assertEqual((job["apify_runs"][0]["actor"], job["apify_runs"][0]["usage_usd"]), ("curious", 0.012))
+        self.assertEqual(job["auth_state"]["status"], "no_cookies_provided")
+
+    def test_flag_unset_and_missing_global_no_cookies_is_the_old_curious_path(self):
+        fake, job, _ns = no_cookie_job([PAGE_A], env={})  # default: flag unset
+        self.assertEqual(fake.cheap_posts(), [])
+        self.assertEqual(job["apify_runs"][0]["actor"], "curious")
+        fake = FakeApify()
+        ns = load_namespace(FLAG_ON, fake)
+        del ns["CHEAP_FIRST"]  # older harness namespace
+        ns["jobs"]["j"] = {"status": "running", "log": []}
+        ns["run_job"]("j", "Brand", "US", [[]], [], [page_url(PAGE_A)], "active", cookies=None, per_page=0)
+        self.assertEqual(ns["jobs"]["j"]["status"], "done")
+        self.assertEqual(fake.cheap_posts(), [])
+
+    def test_keyword_search_no_cookies_is_unchanged(self):
+        fake, job, _ns = no_cookie_job(keywords=["shoes"])
+        self.assertEqual(fake.cheap_posts(), [])
+        self.assertEqual(len(fake.posts), 1)
+        self.assertEqual(job["apify_runs"][0]["actor"], "curious")
+        self.assertEqual(job["auth_state"]["status"], "no_cookies_provided")
+
+    def test_keyword_plus_page_no_cookies_serves_page_cheaply_keyword_via_curious(self):
+        fake, job, _ns = no_cookie_job([PAGE_A], keywords=["shoes"])
+        self.assertEqual(len(fake.cheap_posts()), 1)
+        self.assertEqual([r["actor"] for r in job["apify_runs"]], ["cheap", "curious"])
+        self.assertEqual(len(job["ads"]), 3)  # 2 cheap + 1 curious
+        curious_post = [b for p, b in fake.posts if p == "acts/fake-meta-actor/runs"][0]
+        self.assertEqual(len(curious_post["urls"]), 1)
+        self.assertIn("search_type=keyword_unordered", curious_post["urls"][0]["url"])
+
+    def test_keyword_plus_gated_page_no_cookies_stops_before_the_curious_run(self):
+        fake, job, _ns = no_cookie_job([PAGE_A], keywords=["shoes"], cheap_pages={PAGE_A: "logged_out"}, expect="error")
+        self.assertEqual(len(fake.posts), 1)  # only the cheap run; the keyword curious run was not started
+        self.assertEqual(job["error_code"], "cookies_needed")
+
+    @unittest.skipIf(flask is None, "flask not installed")
+    def test_api_reports_cookies_needed(self):
+        _fake, job, _ns = no_cookie_job([PAGE_A], cheap_pages={PAGE_A: "logged_out"}, expect="error")
+        job["params"] = {}
+        api_ns, _calls, _threads = load_api_namespace()
+        api_ns["jobs"]["jx"] = job
+        client = api_ns["app"].test_client()
+        status = client.get("/api/v1/scrapes/jx").get_json()
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["error"]["code"], "cookies_needed")
+        self.assertEqual(status["error"]["message"], job["error"])
+        self.assertEqual(status["error"]["pages"], [{"page_id": PAGE_A, "reason": "gated_type=LOGGED_OUT"}])
+        self.assertEqual([r["actor"] for r in status["apify_runs"]], ["cheap"])
+        self.assertEqual(status["apify_cost_usd"], 0.012)  # the cheap run that was paid for
+        resp = client.get("/api/v1/scrapes/jx/result")
+        self.assertEqual(resp.status_code, 409)
+        body = resp.get_json()
+        self.assertFalse(body["completed"])
+        self.assertEqual(body["error"]["code"], "cookies_needed")
+        self.assertNotIn("ads", body)
+
+    @unittest.skipIf(flask is None, "flask not installed")
+    def test_api_ordinary_failure_still_scrape_failed_without_pages(self):
+        api_ns, _calls, _threads = load_api_namespace()
+        err = api_ns["_api_job_failure"]({"error": "boom", "log": []})
+        self.assertEqual((err["code"], err["message"]), ("scrape_failed", "boom"))
+        self.assertNotIn("pages", err)
 
 
 # ── Cost logging ─────────────────────────────────────────────────────────────

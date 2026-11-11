@@ -1075,6 +1075,36 @@ def cheap_first_search(search_urls, cookies_list, country, ad_status, log, recor
     return cheap_ads + list(ads or []), auth_state
 
 
+def cheap_pages_no_cookies(page_entries, log, record_run):
+    """Cheap-first for exact-page URLs when NO cookies are locked.
+
+    Each entry (a view_all_page_id URL) is tried on the cheap actor, in order.
+    The first one whose result is not acceptable (any ad gated or without
+    media, zero ads, a failed or errored run) STOPS the whole call: no further
+    cheap run, no curious_coder run, no auth actor run -- nothing more is
+    spent. Returns (ads, cookies_needed): on success (all pages served
+    cheaply) cookies_needed is [] and ads holds every page's ads; on a stop
+    ads is [] (pages already served cheaply are discarded) and cookies_needed
+    is [{"page_id": ..., "reason": ...}]. record_run(summary) stores each
+    cheap run, including the failed one. Never sends cookies.
+    """
+    cheap_ads = []
+    for entry in page_entries:
+        url = entry.get("url") if isinstance(entry, dict) else None
+        m = re.search(r"view_all_page_id=(\d+)", url) if isinstance(url, str) else None
+        page_id = m.group(1) if m else "?"
+        ads, summary, reason = cheap_actor_search(url or "", log)
+        record_run(summary)
+        if ads is None:
+            log(f"  🔒 Cookies needed for page {page_id}: cheap result not usable ({reason}) — "
+                f"no cookies locked, stopping without further spend")
+            return [], [{"page_id": page_id, "reason": reason}]
+        log(f"  💸 Cheap actor OK for page {page_id}: {reason}")
+        cheap_ads.extend(ads)
+    log("  💸 All pages served by the cheap actor — no cookies used, no other actor called")
+    return cheap_ads, []
+
+
 # ── Scrape worker ─────────────────────────────────────────────────────────────
 
 def exact_page_zero_warning(searches, domains, page_urls, ads, apify_runs, expected_urls=None):
@@ -1125,6 +1155,7 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
         results  = [[] for _ in searches]
         auth_states = [None for _ in searches]
         sent_url_counts = []  # URLs sent to an actor, per search (telemetry must cover all of them)
+        cookies_needed = []   # [{"page_id", "reason"}]: exact pages the cheap actor could not serve, cookies unlocked
 
         def run_search(i, queries):
             log(f"🔍 Search {i+1}/{len(searches)}: {queries}")
@@ -1176,14 +1207,32 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
                         job["apify_runs"].append(apify_run)
                     auth_states[i] = auth_state
                 else:
-                    run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": urls, "count": 15, "scrapeAdDetails": True})
-                    run_id = run["data"]["id"]
-                    log(f"  🆔 Apify run {run_id}")
-                    ads, _run_meta = wait_for_run(run_id, log)
-                    if len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
-                        job["apify_runs"].append(_apify_run_summary(run_id, _run_meta, len(ads),
-                                                                    usage_usd=_run_meta.get("usage_usd"),
-                                                                    actor="curious"))
+                    # No cookies locked. With CHEAP_FIRST on, exact-page URLs go to the
+                    # cheap actor first; a page it cannot serve fully STOPS the job
+                    # (code cookies_needed) instead of running curious_coder.
+                    cheap_page_urls = [u for u in urls if "view_all_page_id=" in u["url"]] \
+                        if globals().get("CHEAP_FIRST") else []
+                    ads = []
+                    if cheap_page_urls:
+                        def record_cheap_run(summary):
+                            if len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
+                                job["apify_runs"].append(summary)
+                        ads, needed = cheap_pages_no_cookies(cheap_page_urls, log, record_cheap_run)
+                        if needed:
+                            cookies_needed.extend(needed)
+                            results[i] = []
+                            return
+                    other_urls = [u for u in urls if u not in cheap_page_urls]
+                    if other_urls:  # keyword/domain URLs: today's curious_coder path, unchanged
+                        run    = api_post(f"acts/{META_ACTOR}/runs", {"urls": other_urls, "count": 15, "scrapeAdDetails": True})
+                        run_id = run["data"]["id"]
+                        log(f"  🆔 Apify run {run_id}")
+                        other_ads, _run_meta = wait_for_run(run_id, log)
+                        ads = ads + list(other_ads)
+                        if len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
+                            job["apify_runs"].append(_apify_run_summary(run_id, _run_meta, len(other_ads),
+                                                                        usage_usd=_run_meta.get("usage_usd"),
+                                                                        actor="curious"))
                 log(f"   ✓ {len(ads)} ads returned")
                 results[i] = ads
             except Exception as e:
@@ -1193,6 +1242,18 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
         threads = [threading.Thread(target=run_search, args=(i, q)) for i, q in enumerate(searches)]
         for t in threads: t.start()
         for t in threads: t.join()
+
+        if cookies_needed:
+            # Job fails (API status "failed", error.code "cookies_needed"); pages that WERE served
+            # cheaply are discarded (a failed job never returns ads); their runs stay in apify_runs.
+            ids = [c["page_id"] for c in cookies_needed]
+            job["error_code"]            = "cookies_needed"
+            job["cookies_needed_pages"]  = list(cookies_needed)
+            job["error"]  = ("cookies needed for Page " + ", ".join(ids)
+                             + ": lock Facebook cookies and rerun; nothing more was spent")
+            job["status"] = "error"
+            log(f"❌ cookies_needed: {job['error']}")
+            return
 
         all_ads = []
         for r in results:
@@ -3756,9 +3817,10 @@ def _api_job_summary(job_id, job):
 
 def _api_job_failure(job):
     return {
-        "code":     "scrape_failed",
+        "code":     job.get("error_code") or "scrape_failed",
         "message":  job.get("error") or "Scrape failed",
         "log_tail": list(job.get("log", []))[-5:],
+        **({"pages": list(job["cookies_needed_pages"])} if job.get("cookies_needed_pages") else {}),
     }
 
 
