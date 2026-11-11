@@ -62,6 +62,19 @@ def parse_auth_actor_count(raw, default=100, lo=1, hi=100):
 
 
 AUTH_ACTOR_COUNT = parse_auth_actor_count(os.environ.get("AUTH_ACTOR_COUNT"))  # validated range 1-100, default 100
+
+
+def parse_env_flag(raw):
+    """True only for 1/true/yes/on (case-insensitive); anything else is off."""
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Cheap-first: exact-page URLs try a cheap public actor before the auth actor
+# (see cheap_first_search). Off unless CHEAP_FIRST is explicitly enabled.
+CHEAP_FIRST       = parse_env_flag(os.environ.get("CHEAP_FIRST"))
+CHEAP_ACTOR       = os.environ.get("CHEAP_ACTOR_ID") or "apidojo~facebook-ads-scraper"
+CHEAP_ACTOR_BUILD = (os.environ.get("CHEAP_ACTOR_BUILD") or "").strip()  # optional ?build= tag
+CHEAP_ACTOR_COUNT = parse_auth_actor_count(os.environ.get("CHEAP_ACTOR_COUNT"), default=60)  # validated range 1-100, default 60
 APIFY_BASE  = "https://api.apify.com/v2"
 
 COUNTRIES = [
@@ -143,6 +156,9 @@ def wait_for_run(run_id, log, poll=5, timeout=300):
         "status_message": run_data.get("statusMessage"),
         "telemetry":      None,
     }
+    # Apify's own cost figure for the run (float USD), None when absent/garbage.
+    usage = run_data.get("usageTotalUsd")
+    run_meta["usage_usd"] = float(usage) if isinstance(usage, (int, float)) and not isinstance(usage, bool) else None
     ds_id = run_data.get("defaultDatasetId")
     ads = []
     if ds_id:
@@ -814,7 +830,8 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
         ads, run_meta = wait_for_run(run_id, log)
         auth_state = classify_auth_state(True, run_meta.get("status"), run_meta.get("status_message"), ads,
                                           telemetry=run_meta.get("telemetry"))
-        auth_state["apify_run"] = _apify_run_summary(run_id, run_meta, len(ads))
+        auth_state["apify_run"] = _apify_run_summary(run_id, run_meta, len(ads),
+                                                     usage_usd=run_meta.get("usage_usd"), actor="auth")
         # Deliberately NOT forcing ad["gated_type"] = "ELIGIBLE" here anymore.
         # Whatever gate status the actor itself assigned per ad is the only
         # real signal of whether that specific ad's authenticated content was
@@ -832,7 +849,8 @@ def meta_auth_search(search_urls, cookies_list, count, country, ad_status, log):
     except Exception as e:
         log(f"  ❌ Auth actor failed: {e}")
         failed = classify_auth_state(True, "FAILED", str(e), [])
-        failed["apify_run"] = _apify_run_summary(run_id, {"status": "FAILED", "telemetry": None}, 0, error=True)
+        failed["apify_run"] = _apify_run_summary(run_id, {"status": "FAILED", "telemetry": None}, 0, error=True,
+                                                 actor="auth")
         return [], failed
 
 
@@ -843,12 +861,14 @@ APIFY_TELEMETRY_FIELDS = ("auth_status", "checkpoint_detected", "login_wall_dete
 MAX_APIFY_RUNS_PER_JOB = 10
 
 
-def _apify_run_summary(run_id, run_meta, ad_count, error=False):
+def _apify_run_summary(run_id, run_meta, ad_count, error=False, usage_usd=None, actor=None):
     """Bounded, credential-free record of one actor run for the job and the API.
 
     Never raises: a bug here must not discard ads that were already paid for.
     Values are type-bound (flags only if bool, counts only if int, auth_status
     only a short str); anything else becomes None.
+    usage_usd is the run's Apify cost (None when unknown or not a sane
+    number); actor labels which actor ran ('auth', 'curious' or 'cheap').
     """
     def _telemetry_value(key, value):
         if key in ("checkpoint_detected", "login_wall_detected"):
@@ -865,6 +885,12 @@ def _apify_run_summary(run_id, run_meta, ad_count, error=False):
             telemetry = [{k: _telemetry_value(k, e.get(k)) for k in APIFY_TELEMETRY_FIELDS
                           if isinstance(e, dict) and k in e}
                          for e in entries[:10]]
+        try:
+            usage = None if usage_usd is None or isinstance(usage_usd, bool) else float(usage_usd)
+        except (TypeError, ValueError):
+            usage = None
+        if usage is not None and not (0 <= usage < float("inf")):  # also rejects NaN
+            usage = None
         status = run_meta.get("status")
         return {
             "run_id":    run_id if (isinstance(run_id, str) and run_id.isascii() and run_id.isalnum()
@@ -874,10 +900,179 @@ def _apify_run_summary(run_id, run_meta, ad_count, error=False):
             "error":     bool(error),
             "telemetry": telemetry,
             "telemetry_truncated": truncated,
+            "usage_usd": usage,
+            "actor":     actor if actor in ("auth", "curious", "cheap") else None,
         }
     except Exception:
         return {"run_id": None, "status": None, "ads": ad_count, "error": bool(error),
-                "telemetry": None, "telemetry_truncated": False}
+                "telemetry": None, "telemetry_truncated": False, "usage_usd": None, "actor": None}
+
+
+# ── Cheap-first exact-page scrape (CHEAP_FIRST) ──────────────────────────────
+# Exact-page Ad Library URLs are first tried on a cheap public actor (no
+# cookies are ever sent to it). A URL's cheap result is used only when every
+# ad is ELIGIBLE and carries media; anything else falls back to ONE
+# meta_auth_search call covering all the fallback URLs.
+
+def adapt_cheap_ad(item):
+    """Map one cheap-actor dataset item onto the curious_coder-style record
+    the rest of this file reads (snake_case top-level keys + snapshot).
+
+    Accepts snake_case or camelCase keys and missing fields; never raises.
+    The snapshot is kept as is -- snake_case aliases are only added for
+    camelCase keys that have no snake_case twin. Tagged _source='cheap'.
+    A non-dict (or unreadable) item becomes an empty record with no
+    gated_type, which cheap_result_acceptable rejects.
+    """
+    def snake(key):
+        return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).lower()
+
+    def with_aliases(obj):
+        if not isinstance(obj, dict):
+            return obj
+        out = dict(obj)
+        for k, v in obj.items():
+            if isinstance(k, str):
+                out.setdefault(snake(k), v)
+        return out
+
+    def pick(src, *keys):
+        for k in keys:
+            v = src.get(k)
+            if v is not None:
+                return v
+        return None
+
+    if not isinstance(item, dict):
+        return {"snapshot": {}, "_source": "cheap"}
+    try:
+        snap = item.get("snapshot")
+        snap = with_aliases(snap) if isinstance(snap, dict) else {}
+        for key in ("images", "videos", "cards", "extra_images", "extra_videos"):
+            if isinstance(snap.get(key), list):
+                snap[key] = [with_aliases(x) for x in snap[key]]
+
+        ad_id = pick(item, "ad_archive_id", "adArchiveID", "adArchiveId", "ad_id", "adId")
+        page_id = pick(item, "page_id", "pageID", "pageId") or pick(snap, "page_id")
+        platforms = pick(item, "publisher_platform", "publisherPlatform", "publisherPlatforms")
+        if isinstance(platforms, str):
+            platforms = [platforms]
+        try:
+            collation = int(pick(item, "collation_count", "collationCount") or 0)
+        except (TypeError, ValueError):
+            collation = 0
+        impressions = pick(item, "impressions_with_index", "impressionsWithIndex")
+
+        ad = {
+            "ad_archive_id":          str(ad_id) if ad_id is not None else "",
+            "page_id":                str(page_id) if page_id is not None else "",
+            "page_name":              pick(item, "page_name", "pageName") or pick(snap, "page_name") or "",
+            "is_active":              bool(pick(item, "is_active", "isActive")),
+            "start_date":             pick(item, "start_date", "startDate") or "",
+            "end_date":               pick(item, "end_date", "endDate") or "",
+            "gated_type":             pick(item, "gated_type", "gatedType") or "",
+            "impressions_with_index": impressions if isinstance(impressions, dict) else {},
+            "collation_count":        collation,
+            "collation_id":           pick(item, "collation_id", "collationID", "collationId"),
+            "publisher_platform":     [p for p in platforms if isinstance(p, str)] if isinstance(platforms, list) else [],
+            "snapshot":               snap,
+            "_source":                "cheap",
+        }
+        lib_url = pick(item, "ad_library_url", "adLibraryUrl", "adLibraryURL")
+        if isinstance(lib_url, str) and lib_url:
+            ad["ad_library_url"] = lib_url
+        return ad
+    except Exception:
+        return {"snapshot": {}, "_source": "cheap"}
+
+
+def cheap_result_acceptable(ads):
+    """(ok, reason): ok only when there are ads, EVERY ad's gated_type is
+    exactly ELIGIBLE and EVERY ad has at least one image or video per
+    extract_urls. Never raises."""
+    try:
+        if not ads:
+            return False, "no ads"
+        for ad in ads:
+            if not isinstance(ad, dict):
+                return False, "malformed ad"
+            gated = ad.get("gated_type")
+            if gated != "ELIGIBLE":
+                return False, f"gated_type={str(gated or 'missing')[:40]}"
+            imgs, vids = extract_urls(ad)
+            if not imgs and not vids:
+                return False, "ad without media"
+        return True, f"{len(ads)} ads, all ELIGIBLE with media"
+    except Exception as e:
+        return False, f"acceptance check failed ({type(e).__name__})"
+
+
+def cheap_actor_search(url, log):
+    """Run the cheap actor for ONE exact-page URL.
+
+    Returns (ads, apify_run, reason): ads is the adapted list when the result
+    is acceptable, else None (the URL must fall back). Never sends cookies and
+    never raises; failures are logged by exception type only.
+    """
+    run_id, run_meta = None, {"status": "FAILED", "telemetry": None}
+    path = f"acts/{CHEAP_ACTOR}/runs"
+    if CHEAP_ACTOR_BUILD:
+        path += f"?build={urlquote(CHEAP_ACTOR_BUILD)}"
+    try:
+        run = api_post(path, {
+            "startUrls":    [{"url": url}],
+            "resultsLimit": CHEAP_ACTOR_COUNT,
+            "maxItems":     CHEAP_ACTOR_COUNT,
+        })
+        run_id = run["data"]["id"]
+        log(f"  🆔 Apify run {run_id} (cheap actor {CHEAP_ACTOR})")
+        items, run_meta = wait_for_run(run_id, log)
+    except Exception as e:
+        summary = _apify_run_summary(run_id, run_meta, 0, error=True,
+                                     usage_usd=run_meta.get("usage_usd"), actor="cheap")
+        return None, summary, f"cheap actor error ({type(e).__name__})"
+    ads = [adapt_cheap_ad(it) for it in (items if isinstance(items, list) else [])]
+    summary = _apify_run_summary(run_id, run_meta, len(ads), usage_usd=run_meta.get("usage_usd"), actor="cheap")
+    if run_meta.get("status") != "SUCCEEDED":
+        return None, summary, f"run status {run_meta.get('status')}"
+    ok, reason = cheap_result_acceptable(ads)
+    return (ads if ok else None), summary, reason
+
+
+def cheap_first_search(search_urls, cookies_list, country, ad_status, log, record_run):
+    """Cheap-first replacement for the run_job meta_auth_search call.
+
+    Each exact-page URL (view_all_page_id) is tried on the cheap actor; the
+    rest, plus every URL whose cheap result was not acceptable, go to ONE
+    meta_auth_search call. record_run(summary) stores each cheap run.
+    Returns (ads, auth_state) like meta_auth_search (auth_state may carry
+    "apify_run" for the caller to pop). When every URL was served cheaply the
+    auth actor is not called and the session is reported unknown -- the
+    cookies were never used, so nothing about them was verified.
+    """
+    cheap_ads, fallback = [], []
+    for entry in search_urls:
+        url = entry.get("url") if isinstance(entry, dict) else None
+        if not (isinstance(url, str) and "view_all_page_id=" in url):
+            fallback.append(entry)
+            continue
+        m = re.search(r"view_all_page_id=(\d+)", url)
+        page_id = m.group(1) if m else "?"
+        ads, summary, reason = cheap_actor_search(url, log)
+        record_run(summary)
+        if ads is None:
+            log(f"  ↩️ Cheap actor fallback for page {page_id}: {reason} — using auth actor")
+            fallback.append(entry)
+        else:
+            log(f"  💸 Cheap actor OK for page {page_id}: {reason}")
+            cheap_ads.extend(ads)
+
+    if not fallback:
+        log("  💸 All URLs served by the cheap actor — auth actor not called")
+        return cheap_ads, classify_auth_state(True, None, None, [])
+    ads, auth_state = meta_auth_search(fallback, cookies_list, count=AUTH_ACTOR_COUNT,
+                                       country=country, ad_status=ad_status, log=log)
+    return cheap_ads + list(ads or []), auth_state
 
 
 # ── Scrape worker ─────────────────────────────────────────────────────────────
@@ -966,8 +1161,16 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
                 sent_url_counts.append(len(urls))
 
                 if cookies:
-                    ads, auth_state = meta_auth_search(urls, cookies, count=AUTH_ACTOR_COUNT,
-                                           country=_country, ad_status=_status, log=log)
+                    # globals().get: run_job is also exec'd on its own by tests
+                    # whose namespaces predate CHEAP_FIRST -- missing means off.
+                    if globals().get("CHEAP_FIRST"):
+                        def record_cheap_run(summary):
+                            if len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
+                                job["apify_runs"].append(summary)
+                        ads, auth_state = cheap_first_search(urls, cookies, _country, _status, log, record_cheap_run)
+                    else:
+                        ads, auth_state = meta_auth_search(urls, cookies, count=AUTH_ACTOR_COUNT,
+                                               country=_country, ad_status=_status, log=log)
                     apify_run = auth_state.pop("apify_run", None) if isinstance(auth_state, dict) else None
                     if apify_run and len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
                         job["apify_runs"].append(apify_run)
@@ -978,7 +1181,9 @@ def run_job(job_id, brand, country, searches, domains, page_urls, ad_status, coo
                     log(f"  🆔 Apify run {run_id}")
                     ads, _run_meta = wait_for_run(run_id, log)
                     if len(job["apify_runs"]) < MAX_APIFY_RUNS_PER_JOB:
-                        job["apify_runs"].append(_apify_run_summary(run_id, _run_meta, len(ads)))
+                        job["apify_runs"].append(_apify_run_summary(run_id, _run_meta, len(ads),
+                                                                    usage_usd=_run_meta.get("usage_usd"),
+                                                                    actor="curious"))
                 log(f"   ✓ {len(ads)} ads returned")
                 results[i] = ads
             except Exception as e:
@@ -3523,12 +3728,25 @@ def _api_error(code, message, http_status, **extra):
     return jsonify(body), http_status
 
 
+def job_apify_cost_usd(apify_runs):
+    """Sum of the known usage_usd across a job's recorded runs; None if none is known.
+    Only covers runs kept on the job (at most MAX_APIFY_RUNS_PER_JOB)."""
+    total, known = 0.0, False
+    for run in apify_runs or []:
+        usage = run.get("usage_usd") if isinstance(run, dict) else None
+        if isinstance(usage, (int, float)) and not isinstance(usage, bool) and 0 <= usage < float("inf"):
+            total += usage
+            known = True
+    return round(total, 6) if known else None
+
+
 def _api_job_summary(job_id, job):
     return {
         "job_id":       job_id,
         "status":       API_JOB_STATUS.get(job.get("status"), job.get("status") or "unknown"),
         "auth_state":   job.get("auth_state"),
         "apify_runs":   list(job.get("apify_runs") or []),
+        "apify_cost_usd": job_apify_cost_usd(job.get("apify_runs")),
         "warning":      job.get("warning"),
         "params":       job.get("params"),
         "created_at":   job.get("created_at"),
